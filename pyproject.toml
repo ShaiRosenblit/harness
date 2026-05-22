@@ -1,0 +1,13 @@
+[project]
+name = "harness"
+version = "0.1.0"
+description = "Small autonomous-agent harness with an interactive shell."
+requires-python = ">=3.9"
+dependencies = [
+    "openai>=1.40",
+    "textual>=0.50",
+]
+
+[tool.pyright]
+include = ["harness", "policies", "ui.py"]
+typeCheckingMode = "basic"
