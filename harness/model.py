@@ -94,6 +94,58 @@ def _build_tools_param(tool_specs: List[ToolSpec]) -> list:
     ]
 
 
+def _append_web_tools(tools_param: list, seat: Seat) -> list:
+    """If the seat is granted server-side web tools, append them in the format
+    OpenRouter expects. The tool execution happens entirely on OpenRouter's
+    side; we never see a corresponding tool_call in our adjudicator path."""
+    if not seat.web:
+        return tools_param
+    out = list(tools_param)
+    if "search" in seat.web:
+        out.append({
+            "type": "openrouter:web_search",
+            "openrouter:web_search": {
+                "max_results": seat.web_max_results,
+                "search_context_size": seat.web_search_context_size,
+            },
+        })
+    if "fetch" in seat.web:
+        out.append({"type": "openrouter:web_fetch"})
+    return out
+
+
+def _extract_citations(msg: Any) -> list:
+    """OpenRouter attaches url_citation annotations on the assistant message
+    when its web tools fire. The openai SDK exposes them on .annotations
+    (or via model_dump). Return a list of {url, title, content?} dicts."""
+    raw_anns = getattr(msg, "annotations", None)
+    if raw_anns is None:
+        try:
+            raw_anns = msg.model_dump().get("annotations")
+        except Exception:
+            raw_anns = None
+    if not raw_anns:
+        return []
+    cites: list = []
+    for a in raw_anns:
+        if isinstance(a, dict):
+            t = a.get("type")
+            uc = a.get("url_citation") or {}
+        else:
+            t = getattr(a, "type", None)
+            uc_obj = getattr(a, "url_citation", None)
+            uc = uc_obj.model_dump() if uc_obj is not None and hasattr(uc_obj, "model_dump") else (uc_obj or {})
+        if t == "url_citation":
+            cites.append({
+                "url": uc.get("url"),
+                "title": uc.get("title"),
+                "content": (uc.get("content") or "")[:500] or None,
+                "start_index": uc.get("start_index"),
+                "end_index": uc.get("end_index"),
+            })
+    return cites
+
+
 # ---- The single chokepoint -------------------------------------------------
 
 
@@ -101,14 +153,18 @@ def call_model(seat: Seat, tool_specs: List[ToolSpec], log: Log) -> ModelRespons
     """The ONE wrapper. Builds messages, attaches tool schemas, calls
     OpenRouter, logs request and response, debits the seat's budget."""
     messages = [{"role": "system", "content": seat.prompt}] + list(seat.history)
-    tools_param = _build_tools_param(tool_specs)
+    local_tools = _build_tools_param(tool_specs)
+    tools_param = _append_web_tools(local_tools, seat)
+    tool_summary = [t["function"]["name"] for t in local_tools]
+    web_summary = [t["type"] for t in tools_param if t.get("type", "").startswith("openrouter:")]
     log.write(
         seat,
         "model_request",
         {
             "model": seat.model,
             "messages": messages,
-            "tools": [t["function"]["name"] for t in tools_param],
+            "tools": tool_summary,
+            "web_tools": web_summary,
         },
     )
 
@@ -117,7 +173,8 @@ def call_model(seat: Seat, tool_specs: List[ToolSpec], log: Log) -> ModelRespons
         messages=messages,
         tools=tools_param if tools_param else None,
         tool_choice="auto" if tools_param else None,
-        # Ask OpenRouter to populate usage.cost with the actual billed cost.
+        # Ask OpenRouter to populate usage.cost with the actual billed cost
+        # (token cost + web search cost, when web tools fired).
         extra_body={"usage": {"include": True}},
     )
     msg = completion.choices[0].message
@@ -150,6 +207,19 @@ def call_model(seat: Seat, tool_specs: List[ToolSpec], log: Log) -> ModelRespons
     seat.budget.usd_remaining -= usd
     seat.tokens_prompt += int(usage.get("prompt_tokens", 0) or 0)
     seat.tokens_completion += int(usage.get("completion_tokens", 0) or 0)
+
+    citations = _extract_citations(msg)
+    if citations:
+        # OpenRouter charges roughly $4 per 1,000 search results returned
+        # (Exa pricing pass-through). usage.cost from OpenRouter should
+        # already include this; we record the count for visibility.
+        seat.web_searches += len(citations)
+        # Preserve citations in the assistant history so the model can
+        # reference them on follow-up turns.
+        raw_msg["annotations"] = [
+            {"type": "url_citation", "url_citation": c} for c in citations
+        ]
+
     log.write(
         seat,
         "model_response",
@@ -160,6 +230,7 @@ def call_model(seat: Seat, tool_specs: List[ToolSpec], log: Log) -> ModelRespons
                 for tc in tcs
             ],
             "usage": usage,
+            "citations": citations,
             "model": seat.model,
         },
     )

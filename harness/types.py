@@ -67,6 +67,12 @@ class Seat:
     submit_result: Optional[str] = None
     tokens_prompt: int = 0
     tokens_completion: int = 0
+    # Web (server-side) tool grants. Subset of ("search", "fetch").
+    # Resolved server-side by OpenRouter; the local adjudicator does not run them.
+    web: Tuple[str, ...] = ()
+    web_max_results: int = 4
+    web_search_context_size: str = "low"  # "low" | "medium" | "high"
+    web_searches: int = 0  # cumulative across this seat's turns
 
 
 @dataclass(frozen=True)
@@ -88,3 +94,8 @@ class Policy:
     limits: Limits
     budget_usd: float
     child_policy: Optional["Policy"] = None
+    # Server-side web tool grants (resolved by OpenRouter, not by us).
+    # Subset of ("search", "fetch"). Empty tuple = no web access.
+    web: Tuple[str, ...] = ()
+    web_max_results: int = 4
+    web_search_context_size: str = "low"  # "low" | "medium" | "high"

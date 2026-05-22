@@ -286,6 +286,9 @@ def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
         max_concurrent_seats=seat.limits.max_concurrent_seats,  # forest-wide
         tool_timeout_s=child_policy.limits.tool_timeout_s,
     )
+    # Web attenuation: child can only get web modes the parent already has.
+    child_web = tuple(w for w in child_policy.web if w in seat.web)
+
     child = Seat(
         id=child_id,
         parent_id=seat.id,
@@ -296,6 +299,9 @@ def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
         limits=child_limits,
         budget=Budget(usd_remaining=clamped),
         history=[{"role": "user", "content": prompt}],
+        web=child_web,
+        web_max_results=child_policy.web_max_results,
+        web_search_context_size=child_policy.web_search_context_size,
     )
 
     ctx.log.write(
@@ -305,6 +311,7 @@ def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
             "child_id": child_id,
             "prompt": prompt,
             "granted_tools": list(granted_for_child),
+            "web": list(child_web),
             "budget_usd": clamped,
             "depth": new_depth,
         },

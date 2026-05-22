@@ -84,7 +84,6 @@ def summarize_entry(e: dict) -> str:
         return f"[dim]model_request tools={p.get('tools')}[/dim]"
     if t == "model_response":
         tcs = p.get("tool_calls") or []
-        # support both new (usage) and old (usage_usd) log shapes
         u = p.get("usage") or {}
         suffix = ""
         if isinstance(u, dict):
@@ -95,6 +94,9 @@ def summarize_entry(e: dict) -> str:
                 bits.append(f"tok={pt or 0}/{ct or 0}")
             if usd is not None:
                 bits.append(f"${usd:.5f}{'*' if src == 'estimate' else ''}")
+            cites = p.get("citations") or []
+            if cites:
+                bits.append(f"+{len(cites)}cites")
             if bits:
                 suffix = " [dim](" + " ".join(bits) + ")[/dim]"
         elif "usage_usd" in p:

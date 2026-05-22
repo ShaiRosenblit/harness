@@ -48,6 +48,9 @@ def run_forest(
         limits=policy.limits,
         budget=Budget(usd_remaining=policy.budget_usd),
         history=[{"role": "user", "content": user_message}],
+        web=policy.web,
+        web_max_results=policy.web_max_results,
+        web_search_context_size=policy.web_search_context_size,
     )
 
     try:

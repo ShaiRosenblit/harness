@@ -86,5 +86,8 @@ def start_chat(
         limits=policy.limits,
         budget=Budget(usd_remaining=policy.budget_usd),
         history=[],
+        web=policy.web,
+        web_max_results=policy.web_max_results,
+        web_search_context_size=policy.web_search_context_size,
     )
     return ChatSession(seat=seat, ctx=ctx, log_path=log_path)

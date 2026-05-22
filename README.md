@@ -63,16 +63,37 @@ A policy in `policies/<name>.py` controls what an agent can do:
 - for spawn: a `child_policy` template (children's tools/budget are
   attenuated from the parent)
 
-Two policies ship:
+Policies that ship:
 
 - **`chat`** — conversational mode. `code_exec` only (no `submit`); the
   agent answers in text, you keep the conversation going.
 - **`task`** — one-shot mode. `code_exec` + `submit` + `spawn`. The agent
   must call `submit(...)` to finish. Sub-agents inherit `code_exec` +
   `submit` only.
+- **`task_deep`** — same as `task` but the child template ALSO grants
+  `spawn`, allowing a depth-2 tree (root → child → grandchild).
+- **`research`** — single-seat agent with OpenRouter's server-side
+  `web_search` and `web_fetch` enabled. The agent searches the live web
+  and citations come back attached to its reply.
 
 To add your own, copy one of these and edit. The UI picks them up
 automatically.
+
+### Web access
+
+Set `web=("search",)` and/or `("search", "fetch")` on a `Policy` to grant
+[OpenRouter's server-side web tools](https://openrouter.ai/docs). These
+are NOT executed by the harness — OpenRouter handles them inside the
+chat-completion call, loops internally if the model searches multiple
+times, and returns the final answer with `url_citation` annotations
+which the harness parses into `model_response.payload.citations`.
+`web_max_results` (default 4) and `web_search_context_size` ("low" /
+"medium" / "high", default "low") are configurable per policy. Web cost
+is included in OpenRouter's returned `usage.cost` and debited from the
+seat's budget like any other model call.
+
+Web access attenuates through `spawn` the same way local tools do: a
+child can only get web modes its parent already has.
 
 ## Logs and runs
 
