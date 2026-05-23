@@ -31,6 +31,7 @@ from harness.session import start_chat  # noqa: E402
 
 from textual.app import App, ComposeResult  # noqa: E402
 from textual.binding import Binding  # noqa: E402
+from textual.suggester import Suggester  # noqa: E402
 from textual.widgets import Footer, Header, Input, RichLog  # noqa: E402
 
 
@@ -38,6 +39,58 @@ RUNS_DIR = ROOT / "runs"
 POLICIES_DIR = ROOT / "policies"
 
 DEFAULT_MODEL = "moonshotai/kimi-k2.6"
+
+
+# Slash commands available in the UI. Kept alongside DEFAULT_MODEL so the
+# suggester picks them up; `_dispatch` actually resolves them via `_cmd_<name>`.
+COMMANDS = (
+    "help", "login", "logout", "status", "model",
+    "policies", "runs", "view", "tree",
+    "chat", "end", "run",
+    "clear", "quit", "exit",
+)
+
+
+class HarnessSuggester(Suggester):
+    """Context-aware completer for the prompt input.
+
+    - top-level: completes "/cmd" from COMMANDS
+    - "/run <pol>" / "/chat <pol>": completes from policies/*.py
+    - "/view <run>" / "/tree <run>": completes from runs/* directories
+    """
+
+    def __init__(self) -> None:
+        super().__init__(case_sensitive=False, use_cache=False)
+
+    async def get_suggestion(self, value: str) -> Optional[str]:
+        if not value or not value.startswith("/"):
+            return None
+        # Command name (no space yet)
+        if " " not in value:
+            stem = value[1:].lower()
+            if not stem:
+                return None
+            for name in COMMANDS:
+                if name.startswith(stem):
+                    return "/" + name
+            return None
+        # Subcommand argument
+        head, _, rest = value.partition(" ")
+        cmd = head[1:].lower()
+        # Only complete first arg (i.e. one space, no further spaces yet)
+        if " " in rest:
+            return None
+        if cmd in ("run", "chat"):
+            for p in list_policies():
+                if p.startswith(rest):
+                    return f"{head} {p}"
+            return None
+        if cmd in ("view", "tree"):
+            for r in list_runs():
+                if r.name.startswith(rest):
+                    return f"{head} {r.name}"
+            return None
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -198,7 +251,11 @@ class HarnessApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         yield RichLog(id="output", highlight=True, markup=True, wrap=True)
-        yield Input(placeholder="type a message to chat, or /help for commands", id="prompt")
+        yield Input(
+            placeholder="type a message to chat, or /help for commands  (tab to accept suggestion)",
+            id="prompt",
+            suggester=HarnessSuggester(),
+        )
         yield Footer()
 
     def on_mount(self) -> None:
