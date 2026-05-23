@@ -20,7 +20,7 @@ SYSTEM_PROMPT = (
 
 CHILD = Policy(
     name="task-child",
-    model="openai/gpt-4o-mini",
+    model="moonshotai/kimi-k2.6",
     system_prompt=SYSTEM_PROMPT,
     tools=("code_exec", "submit"),
     limits=Limits(
@@ -36,7 +36,7 @@ CHILD = Policy(
 
 POLICY = Policy(
     name="task",
-    model="openai/gpt-4o-mini",
+    model="moonshotai/kimi-k2.6",
     system_prompt=SYSTEM_PROMPT,
     tools=("code_exec", "submit", "spawn"),
     limits=Limits(

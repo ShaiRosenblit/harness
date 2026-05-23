@@ -24,7 +24,7 @@ PROMPT = (
 
 POLICY = Policy(
     name="research",
-    model="openai/gpt-4o-mini",
+    model="moonshotai/kimi-k2.6",
     system_prompt=PROMPT,
     tools=("submit",),
     limits=Limits(

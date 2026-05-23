@@ -215,9 +215,26 @@ def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
     prompt = args.get("prompt", "")
     # Models sometimes echo OpenAI's internal "functions." namespace prefix
     # when referencing tools. Strip it so attenuation matches our bare names.
+    # Also: web tools live in the seat's `web` field, NOT in `granted_tools`.
+    # If the model puts "web_search" / "web_fetch" in the spawn tools list
+    # (a natural mistake), silently drop them — web is inherited from the
+    # child_policy.web attenuated by parent.web, not selected via spawn args.
+    _WEB_NAMES = {"web_search", "web_fetch",
+                  "openrouter:web_search", "openrouter:web_fetch"}
+
     def _normalize(t: str) -> str:
-        return t[len("functions."):] if t.startswith("functions.") else t
-    requested_tools = tuple(_normalize(t) for t in (args.get("tools") or []))
+        if t.startswith("functions."):
+            t = t[len("functions."):]
+        return t
+    _seen: set = set()
+    requested_tools_list: list = []
+    for raw in args.get("tools") or []:
+        t = _normalize(raw)
+        if t in _WEB_NAMES or t in _seen:
+            continue
+        _seen.add(t)
+        requested_tools_list.append(t)
+    requested_tools = tuple(requested_tools_list)
     requested_budget = float(args.get("budget_usd", 0.0) or 0.0)
     requested_turns = int(args.get("max_turns", child_policy.limits.max_turns) or
                           child_policy.limits.max_turns)
@@ -372,14 +389,18 @@ def register_builtins() -> None:
         ToolSpec(
             name="spawn",
             description=(
-                "Spawn a sub-agent with a goal, a subset of your tools, and a "
-                "budget. Blocks until the sub-agent submits. Returns its "
-                "submitted result. budget_usd is debited from YOUR remaining "
-                "budget immediately, even if the child does not spend it all. "
-                "Give each child enough to actually do the work AND keep "
-                "enough for your own follow-up turns after it returns. A "
-                "reasonable per-child allocation is 20–40% of your remaining "
-                "budget; never give a child more than half."
+                "Spawn a sub-agent with a focused prompt and a budget. Blocks "
+                "until the sub-agent submits. Returns its submitted result.\n"
+                "- `tools` lists LOCAL tool names only (e.g. code_exec, "
+                "submit). DO NOT list web_search/web_fetch here — your child "
+                "inherits web access automatically from its policy template, "
+                "attenuated by yours. If you omit `tools`, the child gets the "
+                "default local toolset for its role.\n"
+                "- `budget_usd` is debited from YOUR remaining budget "
+                "immediately, even if the child does not spend it all. Keep "
+                "enough for your own follow-up turns after the child returns. "
+                "A reasonable per-child allocation is 20–40% of your "
+                "remaining budget; never give a child more than half."
             ),
             parameters={
                 "type": "object",

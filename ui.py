@@ -37,7 +37,7 @@ from textual.widgets import Footer, Header, Input, RichLog  # noqa: E402
 RUNS_DIR = ROOT / "runs"
 POLICIES_DIR = ROOT / "policies"
 
-DEFAULT_MODEL = "openai/gpt-4o-mini"
+DEFAULT_MODEL = "moonshotai/kimi-k2.6"
 
 
 # --------------------------------------------------------------------------- #
@@ -337,7 +337,7 @@ class HarnessApp(App):
         if not rest:
             self._line(f"current: [b]{self._effective_model()}[/b]"
                        + ("  [dim](session override)[/dim]" if self._session_model else "  [dim](policy default)[/dim]"))
-            self._line("usage: [cyan]/model openai/gpt-4o-mini[/cyan]   (or any OpenRouter model id)")
+            self._line("usage: [cyan]/model moonshotai/kimi-k2.6[/cyan]   (or any OpenRouter model id)")
             self._line("       [cyan]/model -[/cyan]   to clear the override")
             return
         if rest == "-":
