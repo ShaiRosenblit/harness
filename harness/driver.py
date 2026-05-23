@@ -26,7 +26,8 @@ def run_seat(seat: Seat, ctx: RunCtx) -> ToolResult:
     # Lazy import keeps the dependency arrow driver -> model (not the reverse).
     from .model import call_model
 
-    ctx.live_seats.add(seat.id)
+    with ctx._spawn_lock:
+        ctx.live_seats.add(seat.id)
     last_result = ToolResult(ok=False, content="no turns executed", error="empty")
     try:
         while not seat.halted:
@@ -95,8 +96,35 @@ def run_seat(seat: Seat, ctx: RunCtx) -> ToolResult:
                 continue
 
             # 7 + 8. Adjudicate + execute + log each tool call, append tool messages.
-            for call in calls:
-                result = adjudicate_and_run(seat, call, ctx)
+            #
+            # Optimization: when the turn is an all-spawn batch (the common
+            # fan-out pattern), run them concurrently and gather results in
+            # the original order. Mixed batches stay serial to preserve the
+            # model's likely intended ordering (e.g. code_exec → spawn).
+            results: list = [None] * len(calls)
+            if len(calls) > 1 and all(c.name == "spawn" for c in calls):
+                futures = {
+                    i: ctx.executor().submit(adjudicate_and_run, seat, c, ctx)
+                    for i, c in enumerate(calls)
+                }
+                for i, fut in futures.items():
+                    try:
+                        results[i] = fut.result()
+                    except Exception as e:
+                        results[i] = ToolResult(
+                            ok=False, content=f"worker exception: {e!r}",
+                            error="exception",
+                        )
+            else:
+                for i, call in enumerate(calls):
+                    results[i] = adjudicate_and_run(seat, call, ctx)
+                    if seat.halted:
+                        break
+
+            # Append tool messages in original order; stop on halt mid-loop.
+            for call, result in zip(calls, results):
+                if result is None:
+                    break  # serial path broke early on halt
                 last_result = result
                 seat.history.append(
                     {
@@ -106,10 +134,10 @@ def run_seat(seat: Seat, ctx: RunCtx) -> ToolResult:
                     }
                 )
                 if seat.halted:
-                    # submit() or a halting denial happened; stop processing more calls.
                     break
 
             # 10. Loop until submit / halt.
         return last_result
     finally:
-        ctx.live_seats.discard(seat.id)
+        with ctx._spawn_lock:
+            ctx.live_seats.discard(seat.id)

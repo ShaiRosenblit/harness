@@ -56,5 +56,7 @@ def run_forest(
     try:
         result = run_seat(root, ctx)
     finally:
+        if ctx._executor is not None:
+            ctx._executor.shutdown(wait=True)
         log.close()
     return ForestResult(root_seat=root, final=result, log_path=log_path)

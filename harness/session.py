@@ -48,6 +48,9 @@ class ChatSession:
         return result.content if result.content is not None else ""
 
     def close(self) -> None:
+        if self.ctx._executor is not None:
+            self.ctx._executor.shutdown(wait=True)
+            self.ctx._executor = None
         self.ctx.log.close()
 
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Optional
@@ -30,6 +32,18 @@ class RunCtx:
     policy: Policy  # root policy; carries child_policy template for spawn
     live_seats: set = field(default_factory=set)
     chat_mode: bool = False  # if True, driver yields on text-only responses
+    # Concurrency. The lock guards parent-budget mutations, child_count
+    # increments, child-id minting, and the live_seats set whenever multiple
+    # spawn calls in the same assistant turn run on different threads.
+    _spawn_lock: threading.Lock = field(default_factory=threading.Lock)
+    _executor: Optional[ThreadPoolExecutor] = None  # lazy; set by driver
+
+    def executor(self) -> ThreadPoolExecutor:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=8, thread_name_prefix="harness-spawn"
+            )
+        return self._executor
 
 
 # ---- Registry --------------------------------------------------------------
@@ -248,27 +262,11 @@ def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
             error="depth_exceeded",
         )
 
-    # Breadth limit.
-    if seat.child_count >= seat.limits.max_children:
-        return ToolResult(
-            ok=False,
-            content=f"breadth limit: already spawned {seat.child_count}",
-            error="breadth_exceeded",
-        )
-
-    # Concurrent seats forest-wide.
-    if len(ctx.live_seats) >= seat.limits.max_concurrent_seats:
-        return ToolResult(
-            ok=False,
-            content="concurrent-seat limit reached",
-            error="concurrency_exceeded",
-        )
-
     # Capability attenuation: requested ⊆ parent.granted_tools AND ⊆ child_policy.tools.
+    # (Pure validation, no shared-state mutation — safe outside the lock.)
     parent_set = set(seat.granted_tools)
     child_menu = set(child_policy.tools)
     if not requested_tools:
-        # Default to the full child menu intersected with parent.
         granted_for_child = tuple(t for t in child_policy.tools if t in parent_set)
     else:
         bad = [t for t in requested_tools if t not in parent_set or t not in child_menu]
@@ -280,30 +278,46 @@ def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
             )
         granted_for_child = requested_tools
 
-    # Budget conservation: clamp + debit parent.
     if requested_budget <= 0:
         return ToolResult(
             ok=False, content="budget_usd must be > 0", error="bad_args"
         )
-    clamped = min(requested_budget, seat.budget.usd_remaining)
-    if clamped <= 0:
-        return ToolResult(
-            ok=False,
-            content="parent has no remaining budget to allocate",
-            error="budget_exhausted",
-        )
-    seat.budget.usd_remaining -= clamped
 
-    seat.child_count += 1
-    child_id = f"{seat.id}.{seat.child_count}"
+    # ---- Critical section: parallel spawn calls in the same turn must not
+    #      race on parent budget, child_count, or live_seats. ----
+    with ctx._spawn_lock:
+        # Re-check the limits that read shared state inside the lock.
+        if seat.child_count >= seat.limits.max_children:
+            return ToolResult(
+                ok=False,
+                content=f"breadth limit: already spawned {seat.child_count}",
+                error="breadth_exceeded",
+            )
+        if len(ctx.live_seats) >= seat.limits.max_concurrent_seats:
+            return ToolResult(
+                ok=False,
+                content="concurrent-seat limit reached",
+                error="concurrency_exceeded",
+            )
+        clamped = min(requested_budget, seat.budget.usd_remaining)
+        if clamped <= 0:
+            return ToolResult(
+                ok=False,
+                content="parent has no remaining budget to allocate",
+                error="budget_exhausted",
+            )
+        seat.budget.usd_remaining -= clamped
+        seat.child_count += 1
+        child_id = f"{seat.id}.{seat.child_count}"
+        ctx.live_seats.add(child_id)
+
     child_limits = Limits(
         max_turns=min(requested_turns, child_policy.limits.max_turns),
         max_depth=child_policy.limits.max_depth,
         max_children=child_policy.limits.max_children,
-        max_concurrent_seats=seat.limits.max_concurrent_seats,  # forest-wide
+        max_concurrent_seats=seat.limits.max_concurrent_seats,
         tool_timeout_s=child_policy.limits.tool_timeout_s,
     )
-    # Web attenuation: child can only get web modes the parent already has.
     child_web = tuple(w for w in child_policy.web if w in seat.web)
 
     child = Seat(
@@ -334,11 +348,11 @@ def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
         },
     )
 
-    ctx.live_seats.add(child_id)
     try:
         child_result = run_seat(child, ctx)
     finally:
-        ctx.live_seats.discard(child_id)
+        with ctx._spawn_lock:
+            ctx.live_seats.discard(child_id)
 
     final = child.submit_result if child.submit_result is not None else child_result.content
     return ToolResult(
