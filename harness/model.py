@@ -10,16 +10,30 @@ from .log import Log
 from .types import Seat, ToolSpec
 
 
-def _harness_preamble() -> str:
+def _harness_preamble(seat: "Seat") -> str:
     """Real-time context the model can rely on each turn: date, ISO timestamp,
-    timezone. Prepended to the system prompt on every model_request so the
-    agent never has to guess what 'today' is or how to date a search."""
+    timezone, and turn budget. Prepended to the system prompt on every
+    model_request so the agent never has to guess what 'today' is, how to
+    date a search, or how many turns remain before it gets cut off."""
     now = _dt.datetime.now().astimezone()
+    remaining = seat.max_turns - seat.turns_used
+    if "submit" in seat.tools:
+        budget_line = (
+            f"  turns: {seat.turns_used}/{seat.max_turns} used "
+            f"({remaining} remaining — call submit() before they run out, "
+            f"or your work is lost)\n"
+        )
+    else:
+        budget_line = (
+            f"  turns: {seat.turns_used}/{seat.max_turns} used "
+            f"({remaining} remaining)\n"
+        )
     return (
         f"[harness context]\n"
         f"  today: {now.date().isoformat()}\n"
         f"  now:   {now.isoformat(timespec='seconds')}\n"
         f"  tz:    {_time.tzname[_time.daylight]}\n"
+        f"{budget_line}"
         f"Use this date when reasoning about anything time-sensitive. "
         f"For time-sensitive web queries (latest, recent, current, "
         f"today's, this week's, this year's, etc.), include today's "
@@ -148,7 +162,7 @@ def call_model(seat: Seat, tool_specs: List[ToolSpec], log: Log) -> ModelRespons
     calls OpenRouter, logs request and response, and accumulates the seat's
     observability counters (cost_usd, tokens_*, web_searches). Counters are
     NOT enforced — `max_turns` and `max_depth`/`max_children` are the caps."""
-    system_content = _harness_preamble() + "\n" + seat.system_prompt
+    system_content = _harness_preamble(seat) + "\n" + seat.system_prompt
     messages = [{"role": "system", "content": system_content}] + list(seat.history)
     tools_param = _build_tools_param(tool_specs)
     log.write(

@@ -121,9 +121,12 @@ def main() -> int:
     print(f"cost:    ${seat.cost_usd:.4f}")
     print(f"halted:  {seat.halt_reason or '—'}")
 
-    memo = (final.content or "").strip()
+    if seat.halt_reason != "submit":
+        print(f"\nno memo: seat halted on '{seat.halt_reason}', not submit().")
+        return 1
+    memo = (seat.submit_result or "").strip()
     if not memo:
-        print("\nno memo submitted.")
+        print("\nno memo: submit() called with empty result.")
         return 1
 
     MEMOS_DIR.mkdir(parents=True, exist_ok=True)

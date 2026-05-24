@@ -37,7 +37,12 @@ Workflow — execute via tools, do not describe:
 - First turn: call web_search for the most specific primary-source
   query you can write. Do not write a plan.
 - Subsequent turns: alternate web_search / web_fetch / code_exec.
+  Issue parallel tool calls (multiple search/fetch in one turn) when
+  the queries are independent — it's much more turn-efficient.
 - When you have enough sourced facts: call submit() with the memo.
+- If you're running low on turns (≤5 remaining), call submit() with
+  a partial memo using whatever you've sourced so far. List the gaps
+  in "What I could not verify". A partial sourced memo beats nothing.
 
 Memo structure for submit():
 
@@ -67,7 +72,7 @@ AGENT = Agent(
     model="moonshotai/kimi-k2.6",
     system_prompt=PROMPT,
     tools=("code_exec", "submit"),
-    max_turns=30,
+    max_turns=50,
     max_depth=0,
     max_children=0,
     tool_timeout_s=45.0,
