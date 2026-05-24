@@ -22,6 +22,24 @@ from .types import (
 
 
 @dataclass
+class ApprovalRequest:
+    """A pending request for the user to approve or deny a risky tool call.
+
+    The worker thread blocks on `event`; the UI sets `decision` (to
+    "approve" or "deny") and then `event.set()` to release it.
+    `displayed` is a one-shot flag the UI flips when it first shows the
+    request, so polling won't double-print.
+    """
+    id: str
+    seat_id: str
+    tool_name: str
+    args: dict
+    event: threading.Event
+    decision: Optional[str] = None   # None | "approve" | "deny"
+    displayed: bool = False
+
+
+@dataclass
 class RunCtx:
     log: Log
     workdir: Path
@@ -29,6 +47,10 @@ class RunCtx:
     live_seats: set = field(default_factory=set)
     _spawn_lock: threading.Lock = field(default_factory=threading.Lock)
     _executor: Optional[ThreadPoolExecutor] = None
+    # Approval gate: pending and resolved requests for risky tool calls.
+    _approvals: Dict[str, ApprovalRequest] = field(default_factory=dict)
+    _approval_seq: int = 0
+    _approvals_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def executor(self) -> ThreadPoolExecutor:
         if self._executor is None:
@@ -36,6 +58,44 @@ class RunCtx:
                 max_workers=8, thread_name_prefix="harness-spawn"
             )
         return self._executor
+
+    def request_approval(self, seat_id: str, tool_name: str, args: dict) -> ApprovalRequest:
+        """Register a pending approval; caller blocks on req.event.wait()."""
+        with self._approvals_lock:
+            self._approval_seq += 1
+            req = ApprovalRequest(
+                id=f"a{self._approval_seq}",
+                seat_id=seat_id,
+                tool_name=tool_name,
+                args=args,
+                event=threading.Event(),
+            )
+            self._approvals[req.id] = req
+        return req
+
+    def resolve_approval(self, approval_id: str, decision: str) -> Optional[ApprovalRequest]:
+        """Set the decision and release the waiting worker. Returns the
+        request if it was pending; None if not found or already resolved."""
+        if decision not in ("approve", "deny"):
+            return None
+        with self._approvals_lock:
+            req = self._approvals.get(approval_id)
+            if req is None or req.decision is not None:
+                return None
+            req.decision = decision
+        req.event.set()
+        return req
+
+    def pending_undisplayed(self) -> list:
+        """Return pending approvals that haven't been shown to the user
+        yet, and mark them displayed so we don't re-show on next poll."""
+        out = []
+        with self._approvals_lock:
+            for req in self._approvals.values():
+                if req.decision is None and not req.displayed:
+                    req.displayed = True
+                    out.append(req)
+        return out
 
 
 # ---- Seat factory (shared by forest, session, spawn) ----------------------
@@ -135,6 +195,41 @@ def adjudicate_and_run(seat: Seat, call: ToolCall, ctx: RunCtx) -> ToolResult:
         {"tool": call.name, "args": call.args, "call_id": call.id},
     )
 
+    # Approval gate for risky tools. Blocks the worker thread until the
+    # user types /approve <id> or /deny <id> in the UI.
+    if spec.risky:
+        req = ctx.request_approval(seat.id, call.name, call.args or {})
+        ctx.log.write(
+            seat,
+            "approval_request",
+            {"approval_id": req.id, "tool": call.name, "args": call.args, "call_id": call.id},
+        )
+        req.event.wait()   # ← blocks here until UI resolves
+        ctx.log.write(
+            seat,
+            "approval_decision",
+            {"approval_id": req.id, "decision": req.decision, "tool": call.name},
+        )
+        if req.decision != "approve":
+            result = ToolResult(
+                ok=False,
+                content=f"denied by user (approval {req.id})",
+                error="denied",
+            )
+            ctx.log.write(
+                seat,
+                "tool_result",
+                {
+                    "tool": call.name,
+                    "call_id": call.id,
+                    "ok": False,
+                    "error": "denied",
+                    "content": result.content,
+                    "meta": {},
+                },
+            )
+            return result
+
     try:
         result = spec.handler(seat, call.args, ctx)
     except subprocess.TimeoutExpired:
@@ -168,6 +263,25 @@ def _h_code_exec(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
     code = args.get("code", "")
     proc = subprocess.run(
         ["python3", "-c", code],
+        cwd=str(ctx.workdir),
+        capture_output=True,
+        text=True,
+        timeout=seat.tool_timeout_s,
+    )
+    out = (proc.stdout or "")[-8000:]
+    err = (proc.stderr or "")[-2000:]
+    content = f"stdout:\n{out}\nstderr:\n{err}\nexit: {proc.returncode}"
+    return ToolResult(
+        ok=(proc.returncode == 0),
+        content=content,
+        meta={"exit": proc.returncode},
+    )
+
+
+def _h_bash(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
+    cmd = args.get("command", "")
+    proc = subprocess.run(
+        ["bash", "-c", cmd],
         cwd=str(ctx.workdir),
         capture_output=True,
         text=True,
@@ -278,6 +392,26 @@ def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
 
 
 def register_builtins() -> None:
+    register(
+        ToolSpec(
+            name="bash",
+            description=(
+                "Run an arbitrary shell command via `bash -c`. Returns "
+                "stdout, stderr, and exit code. This tool is gated — each "
+                "call requires explicit user approval before it runs. "
+                "Prefer code_exec for Python work; use bash when you need "
+                "the shell (file ops, installing packages, running other "
+                "binaries, pipelines)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+            handler=_h_bash,
+            risky=True,
+        )
+    )
     register(
         ToolSpec(
             name="code_exec",

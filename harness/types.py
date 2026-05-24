@@ -25,6 +25,9 @@ class ToolSpec:
     description: str
     parameters: dict
     handler: Callable[..., ToolResult]
+    # When True, calls to this tool are gated by the approval mechanism:
+    # the worker blocks until the user explicitly /approve or /deny it.
+    risky: bool = False
 
 
 @dataclass

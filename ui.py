@@ -46,6 +46,7 @@ COMMANDS = (
     "help", "login", "logout", "status", "model",
     "agents", "runs", "view", "tree",
     "chat", "end", "run",
+    "approve", "deny", "approvals",
     "clear", "quit", "exit",
 )
 
@@ -68,6 +69,9 @@ HELP_TEXT = """\
   [cyan]/chat[/cyan] [dim][agent] [flags...][/dim]              start a chat (default: chat)
   [cyan]/end[/cyan]                 end the current chat
   [cyan]/run[/cyan]  [dim]<agent> [flags...] <message...>[/dim]  one-shot task
+  [cyan]/approve[/cyan] [dim]<id>[/dim]    approve a pending risky tool call
+  [cyan]/deny[/cyan] [dim]<id>[/dim]       deny a pending risky tool call
+  [cyan]/approvals[/cyan]           list pending + resolved approvals for this run
   [cyan]/clear[/cyan] · [cyan]/help[/cyan] · [cyan]/quit[/cyan]
 
 [b]flags[/b] (work with [cyan]/run[/cyan] and [cyan]/chat[/cyan])
@@ -349,6 +353,7 @@ class HarnessApp(App):
         self._is_running: bool = False
         self._chat = None
         self._chat_agent_name: Optional[str] = None
+        self._run_ctx = None   # set by the run worker before driver starts
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -376,6 +381,7 @@ class HarnessApp(App):
         self._line("")
         self.query_one("#prompt", Input).focus()
         self.set_interval(0.5, self._tail_active_run)
+        self.set_interval(0.4, self._check_pending_approvals)
 
     # ---- output ---------------------------------------------------------- #
 
@@ -542,6 +548,80 @@ class HarnessApp(App):
             return
         entries = read_log(run / "log.jsonl")
         self._line(build_tree(entries) or "(no seats)")
+
+    # ---- approval gate ------------------------------------------------- #
+
+    def _active_ctx(self):
+        """Return the RunCtx for whichever activity is currently running."""
+        if self._chat is not None:
+            return self._chat.ctx
+        return self._run_ctx
+
+    def _check_pending_approvals(self) -> None:
+        ctx = self._active_ctx()
+        if ctx is None:
+            return
+        try:
+            for req in ctx.pending_undisplayed():
+                self._line(
+                    f"\n[b yellow on red] ⚠ APPROVAL NEEDED [/]  "
+                    f"id=[b cyan]{req.id}[/b cyan]  "
+                    f"seat=[cyan]{req.seat_id}[/cyan]  "
+                    f"tool=[b]{req.tool_name}[/b]"
+                )
+                args_text = json.dumps(req.args, indent=2)
+                # Indent for readability
+                for line in args_text.splitlines():
+                    self._line(f"    {line}")
+                self._line(
+                    f"  [dim]respond with[/dim] [green]/approve {req.id}[/green]  "
+                    f"[dim]or[/dim] [red]/deny {req.id}[/red]\n"
+                )
+        except Exception:
+            pass
+
+    def _cmd_approve(self, rest: str) -> None:
+        self._resolve_approval(rest.strip(), "approve")
+
+    def _cmd_deny(self, rest: str) -> None:
+        self._resolve_approval(rest.strip(), "deny")
+
+    def _resolve_approval(self, aid: str, decision: str) -> None:
+        if not aid:
+            self._line(f"usage: [cyan]/{decision} <approval-id>[/cyan]")
+            return
+        ctx = self._active_ctx()
+        if ctx is None:
+            self._line("[red]no active run with pending approvals[/red]")
+            return
+        req = ctx.resolve_approval(aid, decision)
+        if req is None:
+            self._line(f"[red]no such pending approval:[/red] {aid}")
+            return
+        glyph = "[green]✓ approved[/green]" if decision == "approve" else "[red]✗ denied[/red]"
+        self._line(f"  {glyph}  {aid}  ({req.tool_name})")
+
+    def _cmd_approvals(self, _rest: str) -> None:
+        ctx = self._active_ctx()
+        if ctx is None:
+            self._line("[dim](no active run)[/dim]")
+            return
+        with ctx._approvals_lock:
+            items = list(ctx._approvals.values())
+        if not items:
+            self._line("[dim](no approvals so far)[/dim]")
+            return
+        for req in items:
+            if req.decision is None:
+                status = "[yellow]pending[/yellow]"
+            elif req.decision == "approve":
+                status = "[green]approved[/green]"
+            else:
+                status = "[red]denied[/red]"
+            self._line(
+                f"  [cyan]{req.id}[/cyan]  {status}  {req.tool_name}  "
+                f"[dim]{json.dumps(req.args)[:120]}[/dim]"
+            )
 
     # ---- /chat ---------------------------------------------------------- #
 
@@ -714,11 +794,14 @@ class HarnessApp(App):
 
     async def _do_run(self, agent: Agent, run_dir: Path, message: str) -> None:
         try:
+            def grab_ctx(ctx):
+                self._run_ctx = ctx
             res = run_forest(
                 agent=agent,
                 log_path=run_dir / "log.jsonl",
                 workdir=run_dir / "wd",
                 user_message=message,
+                on_ctx=grab_ctx,
             )
             seat = res.root_seat
             summary = (
@@ -738,6 +821,7 @@ class HarnessApp(App):
         self._line(summary)
         self._line("")
         self._is_running = False
+        self._run_ctx = None
 
     # ---- live tail ------------------------------------------------------ #
 
