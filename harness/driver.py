@@ -33,6 +33,7 @@ def run_seat(seat: Seat, ctx: RunCtx) -> ToolResult:
       - submit:       agent called submit (seat.submit_result populated)
       - yield:        chat-mode seat replied with text only
     """
+    from .compact import maybe_compact
     from .model import call_model
 
     chat_mode = "submit" not in seat.tools
@@ -57,7 +58,14 @@ def run_seat(seat: Seat, ctx: RunCtx) -> ToolResult:
                 )
                 return ToolResult(ok=False, content="max_turns exhausted", error="max_turns")
 
-            # 2. Model call.
+            # 2. Compact history if the previous turn's prompt got large.
+            # Done before the next model call (not right after the previous
+            # one) so the full assistant+tool-result pairs are present in
+            # history at the time of summarization — collapsing in the
+            # middle would leave orphaned tool_call_ids.
+            maybe_compact(seat, seat.tokens_prompt_last, ctx.log)
+
+            # 3. Model call.
             tool_specs = get_specs(seat.tools)
             resp = call_model(seat, tool_specs, ctx.log)
             seat.turns_used += 1

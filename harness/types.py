@@ -59,6 +59,7 @@ class Seat:
     halt_reason: Optional[str] = None
     submit_result: Optional[str] = None
     tokens_prompt: int = 0
+    tokens_prompt_last: int = 0
     tokens_completion: int = 0
     cost_usd: float = 0.0
     web_searches: int = 0
