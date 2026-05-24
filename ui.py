@@ -775,7 +775,11 @@ class HarnessApp(App):
 
 
 def main() -> int:
-    HarnessApp().run()
+    # mouse=False disables Textual's mouse capture so your terminal's
+    # native text selection (and copy/paste) works normally. The cost is
+    # that mouse clicks inside the app do nothing — but the UI is
+    # keyboard-driven anyway.
+    HarnessApp().run(mouse=False)
     return 0
 
 
