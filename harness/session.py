@@ -58,6 +58,12 @@ def start_chat(
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
+    from .resume import write_meta
+    write_meta(
+        log_path.parent, agent, kind="chat",
+        max_turns_per_round=agent.max_turns,
+    )
+
     log = Log(log_path)
     ctx = RunCtx(log=log, workdir=workdir, agent=agent, auto_approve=auto_approve)
     seat = mint_seat(agent=agent, seat_id="s0", parent_id=None, depth=0, history=[])

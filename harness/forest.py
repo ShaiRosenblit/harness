@@ -38,6 +38,9 @@ def run_forest(
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
+    from .resume import write_meta
+    write_meta(log_path.parent, agent, kind="forest")
+
     log = Log(log_path)
     ctx = RunCtx(log=log, workdir=workdir, agent=agent, auto_approve=auto_approve)
     if on_ctx is not None:

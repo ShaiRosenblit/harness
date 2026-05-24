@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT))
 
 from harness import credentials  # noqa: E402
 from harness.forest import run_forest  # noqa: E402
+from harness.resume import continue_chat, continue_forest, run_kind  # noqa: E402
 from harness.session import start_chat  # noqa: E402
 from harness.types import Agent  # noqa: E402
 
@@ -150,7 +151,7 @@ DEFAULT_CHAT_AGENT = "chat"
 COMMANDS = (
     "help", "login", "logout", "status", "model",
     "agents", "skills", "runs", "view", "tree",
-    "chat", "end", "run",
+    "chat", "end", "run", "continue",
     "approve", "deny", "approvals", "auto",
     "clear", "quit", "exit",
 )
@@ -174,6 +175,7 @@ HELP_TEXT = """\
   [cyan]/chat[/cyan] [dim][agent] [flags...][/dim]              start a chat (default: chat)
   [cyan]/end[/cyan]                 end the current chat
   [cyan]/run[/cyan]  [dim]<agent> [flags...] <message...>[/dim]  one-shot task
+  [cyan]/continue[/cyan] [dim]<run> [extra message...][/dim]  resume a stopped run (chat or one-shot)
   [cyan]/approve[/cyan] [dim]<id>[/dim]    approve a pending risky tool call
   [cyan]/deny[/cyan] [dim]<id>[/dim]       deny a pending risky tool call
   [cyan]/approvals[/cyan]           list pending + resolved approvals for this run
@@ -443,7 +445,7 @@ class HarnessSuggester(Suggester):
             for n in list_agents():
                 if n.startswith(rest):
                     return f"{head} {n}"
-        if cmd in ("view", "tree"):
+        if cmd in ("view", "tree", "continue"):
             for r in list_runs():
                 if r.name.startswith(rest):
                     return f"{head} {r.name}"
@@ -1027,6 +1029,117 @@ class HarnessApp(App):
         self._line("")
         self._is_running = False
         self._run_ctx = None
+
+    # ---- /continue ------------------------------------------------------ #
+
+    def _cmd_continue(self, rest: str) -> None:
+        """Resume a stopped run by replaying its log into a fresh seat."""
+        if self._is_running:
+            self._line("[yellow]busy[/yellow] — wait for the current task to finish")
+            return
+        try:
+            tokens = shlex.split(rest) if rest else []
+        except ValueError as e:
+            self._line(f"[red]bad quoting:[/red] {e}")
+            return
+        if not tokens:
+            self._line("usage: [cyan]/continue <run> [extra message...][/cyan]")
+            self._line("       [dim](see [cyan]/runs[/cyan] for run names)[/dim]")
+            return
+
+        run_name = tokens[0]
+        extra = " ".join(tokens[1:]).strip()
+        run = self._resolve_run(run_name)
+        if run is None:
+            return
+
+        kind = run_kind(run)
+        if kind is None:
+            self._line(
+                f"[red]can't continue:[/red] {run_name} has no meta.json. "
+                "Runs started before /continue support landed can't be resumed."
+            )
+            return
+
+        if not credentials.get_api_key():
+            self._line("[red]continue needs an API key.[/red]  use [cyan]/login <key>[/cyan] first.")
+            return
+        credentials.inject_env()
+
+        if kind == "chat":
+            if self._chat is not None:
+                self._line(
+                    f"[yellow]chat already active[/yellow] (agent: {self._chat_agent_name}). "
+                    "use [cyan]/end[/cyan] first."
+                )
+                return
+            try:
+                self._chat = continue_chat(run, auto_approve=self._auto_approve)
+            except Exception as e:
+                self._line(f"[red]continue failed:[/red] {e}")
+                return
+            # Recover the agent name from the run dir prefix
+            # `chat-<agent>-<ts>` (UI naming convention); fall back to
+            # the model id if the dir doesn't match.
+            stem = run.name
+            if stem.startswith("chat-"):
+                self._chat_agent_name = stem[len("chat-"):].rsplit("-", 2)[0]
+            else:
+                self._chat_agent_name = self._chat.seat.model.split("/")[-1]
+            self._active_run = run / "log.jsonl"
+            self._active_seen_seq = 0
+            seat = self._chat.seat
+            self._line(
+                f"[b green]chat resumed[/b green]   "
+                f"agent=[cyan]{self._chat_agent_name}[/cyan]  "
+                f"model=[b]{seat.model}[/b]  turns=[b]{seat.turns_used}[/b]  "
+                f"history=[b]{len(seat.history)}[/b]  "
+                f"spent=$[b]{seat.cost_usd:.4f}[/b]"
+            )
+            self._line(f"[dim]   {run}[/dim]")
+            if extra:
+                # User passed an extra message — send it now to kick things off.
+                self._send_chat(extra)
+            else:
+                self._line(
+                    "[dim]type a message to keep going, or [/dim]"
+                    "[cyan]/end[/cyan][dim] to stop.[/dim]"
+                )
+            return
+
+        # kind == "forest"
+        self._active_run = run / "log.jsonl"
+        self._active_seen_seq = 0
+        self._is_running = True
+        self._line(f"[b]→ continuing[/b] [cyan]{run.name}[/cyan]"
+                   + (f"  [dim]+message[/dim]" if extra else ""))
+        self.run_worker(
+            self._do_continue_forest(run, extra),
+            exclusive=True, group="run", thread=True,
+        )
+
+    async def _do_continue_forest(self, run_dir: Path, extra: str) -> None:
+        try:
+            def grab_ctx(ctx):
+                self._run_ctx = ctx
+            res = continue_forest(
+                run_dir=run_dir,
+                extra_user_message=extra or None,
+                on_ctx=grab_ctx,
+                auto_approve=self._auto_approve,
+            )
+            seat = res.root_seat
+            summary = (
+                f"[b green]done[/b green]   submit={seat.submit_result!r}   "
+                f"halt={seat.halt_reason}   turns={seat.turns_used}   "
+                f"tokens={seat.tokens_prompt}/{seat.tokens_completion}   "
+                f"spent=$[b]{seat.cost_usd:.4f}[/b]"
+            )
+            self.call_from_thread(self._on_run_done, summary)
+        except Exception:
+            self.call_from_thread(
+                self._on_run_done, f"[red]FAILED:[/red]\n{traceback.format_exc()}"
+            )
 
     # ---- live tail ------------------------------------------------------ #
 
