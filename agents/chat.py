@@ -15,23 +15,30 @@ PROMPT = (
     "Tools available to you:\n"
     "  - code_exec — run Python in a scratch directory (arithmetic, "
     "parsing, file work, anything code does better than guessing).\n"
+    "  - bash — run an arbitrary shell command. RISKY: each call asks "
+    "the user for approval before running. Use it when you need the "
+    "shell (file operations beyond the scratch dir, installing "
+    "binaries, running other tools, pipelines). Otherwise prefer "
+    "code_exec.\n"
     "  - web_search / web_fetch — live web access. Use whenever the "
     "answer could have changed recently.\n"
+    "  - use_skill(name) — load a skill from [available skills] when "
+    "one matches the task.\n"
     "  - spawn — delegate a focused sub-task to a fresh sub-agent that "
     "returns its submitted result to you. Useful for parallel research "
     "or to isolate long/expensive work from your main context.\n"
     "  - submit — send your reply to the user. Always end a turn by "
     "calling submit() with the final reply text.\n"
-    "Reply concisely. Use spawn when a sub-task is genuinely "
-    "independent and benefits from isolation; otherwise just answer "
-    "directly with code_exec / web tools."
+    "Reply concisely. Reach for the right tool: code_exec for Python, "
+    "bash for the shell, web for current info, use_skill for "
+    "structured workflows, spawn for genuine parallelism."
 )
 
 
 AGENT = Agent(
     model="moonshotai/kimi-k2.6",
     system_prompt=PROMPT,
-    tools=("code_exec", "submit", "spawn", "use_skill"),
+    tools=("code_exec", "bash", "submit", "spawn", "use_skill"),
     max_turns=30,
     max_depth=10,
     max_children=3,
