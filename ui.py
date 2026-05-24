@@ -12,6 +12,7 @@ After login:   /run <agent> <message>    one-shot task
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import shutil
 import sys
@@ -33,19 +34,62 @@ from harness.types import Agent  # noqa: E402
 from textual.app import App, ComposeResult  # noqa: E402
 from textual.binding import Binding  # noqa: E402
 from textual.suggester import Suggester  # noqa: E402
+from textual import events  # noqa: E402
 from textual.widgets import Footer, Header, Input, RichLog  # noqa: E402
+
+
+_PASTE_MARKER_RE = re.compile(r"\[Pasted #(\d+) \+(\d+) lines\]")
 
 
 class SuggestingInput(Input):
     """Input that accepts the suggester's ghost text on Tab (the default
     keymap binds Tab to focus-next, which is useless when this is the only
     interactive widget). Holds priority=True so it beats the App's default
-    Tab handling."""
+    Tab handling.
+
+    Multi-line paste: Textual's Input is single-line and would drop every
+    line after the first. We stash the full text under a numbered marker
+    `[Pasted #N +K lines]` so the user can still edit around it; on
+    submit the marker expands back to the real text.
+    """
 
     BINDINGS = [
         Binding("tab", "cursor_right", "accept suggestion",
                 show=False, priority=True),
     ]
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._pastes: dict[int, str] = {}
+
+    def _on_paste(self, event: events.Paste) -> None:
+        text = event.text or ""
+        if not text:
+            event.stop()
+            return
+        if "\n" in text:
+            paste_id = len(self._pastes) + 1
+            self._pastes[paste_id] = text
+            line_count = text.count("\n") + 1
+            insert = f"[Pasted #{paste_id} +{line_count - 1} lines]"
+        else:
+            insert = text
+        selection = self.selection
+        if selection.is_empty:
+            self.insert_text_at_cursor(insert)
+        else:
+            self.replace(insert, *selection)
+        event.stop()
+
+    def consume(self) -> str:
+        """Return the current value with any paste markers expanded back
+        to their full text, and reset the input/paste store."""
+        def sub(m: re.Match[str]) -> str:
+            return self._pastes.get(int(m.group(1)), m.group(0))
+        expanded = _PASTE_MARKER_RE.sub(sub, self.value)
+        self.value = ""
+        self._pastes.clear()
+        return expanded
 
 
 RUNS_DIR = ROOT / "runs"
@@ -442,11 +486,16 @@ class HarnessApp(App):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "prompt":
             return
-        raw = (event.value or "").strip()
-        event.input.value = ""
+        inp = event.input
+        if isinstance(inp, SuggestingInput):
+            raw = inp.consume().strip()
+        else:
+            raw = (event.value or "").strip()
+            inp.value = ""
         if not raw:
             return
-        self._echo(raw)
+        self._echo(raw if "\n" not in raw
+                   else raw.split("\n", 1)[0] + f" [+{raw.count(chr(10))} lines]")
         try:
             self._dispatch(raw)
         except Exception:
