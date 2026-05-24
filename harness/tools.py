@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
 import threading
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -308,6 +312,143 @@ def _h_submit(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
     return ToolResult(ok=True, content=seat.submit_result, meta={"submitted": True})
 
 
+def _h_web_search(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
+    """Web search via OpenRouter's `web` plugin on a cheap side-call.
+
+    OpenRouter's `openrouter:web_search` tool type is broken with
+    several models (notably Kimi K2.6) — the model emits its native
+    tool-call template into the visible content stream and the
+    response never carries structured tool_calls back. The fix is to
+    expose web_search as a *regular* function tool: the model calls
+    it like any other function, we run the search ourselves by piggy-
+    backing on OpenRouter's `plugins=[{id:"web"}]` against a small
+    model, and return the cited results as a tool result.
+
+    Cost-wise this is a single short cheap-model call per search."""
+    from . import credentials
+    from openai import OpenAI
+
+    query = args.get("query", "")
+    if not isinstance(query, str) or not query.strip():
+        return ToolResult(ok=False, content="missing 'query'", error="bad_args")
+
+    credentials.inject_env()
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return ToolResult(
+            ok=False, content="OPENROUTER_API_KEY not set", error="no_auth"
+        )
+
+    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+    try:
+        completion = client.chat.completions.create(
+            model="openai/gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"Search the web for: {query}\n\n"
+                        "Reply with one short sentence per result and "
+                        "nothing else. Do not add commentary."
+                    ),
+                }
+            ],
+            max_completion_tokens=600,
+            extra_body={
+                "plugins": [
+                    {"id": "web", "max_results": seat.web_max_results}
+                ],
+                "usage": {"include": True},
+            },
+        )
+    except Exception as e:
+        return ToolResult(
+            ok=False, content=f"web_search failed: {e!r}", error="search_failed"
+        )
+
+    msg = completion.choices[0].message
+    summary = (msg.content or "").strip()
+    raw_anns = getattr(msg, "annotations", None) or []
+    results: list = []
+    for a in raw_anns:
+        ad = a.model_dump() if hasattr(a, "model_dump") else (a or {})
+        if ad.get("type") != "url_citation":
+            continue
+        uc = ad.get("url_citation") or {}
+        url = uc.get("url") or ""
+        title = (uc.get("title") or "").strip()
+        snippet = (uc.get("content") or "").strip().replace("\n", " ")
+        if len(snippet) > 300:
+            snippet = snippet[:297] + "..."
+        results.append(f"- {title or url}\n  {url}\n  {snippet}")
+
+    seat.web_searches += 1
+    parts = [f"web_search: {query}"]
+    if summary:
+        parts.append("\nSUMMARY:\n" + summary)
+    if results:
+        parts.append("\nRESULTS:\n" + "\n\n".join(results))
+    elif not summary:
+        parts.append("\n(no results)")
+    return ToolResult(ok=True, content="\n".join(parts))
+
+
+def _h_web_fetch(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
+    """Fetch the given URL and return the text content (HTML stripped).
+
+    Caps the response at ~200 KB so a long page doesn't blow context."""
+    url = args.get("url", "")
+    if not isinstance(url, str) or not url.strip():
+        return ToolResult(ok=False, content="missing 'url'", error="bad_args")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return ToolResult(
+            ok=False, content="url must start with http:// or https://", error="bad_args"
+        )
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (compatible; harness-bot/1.0; "
+                "+https://github.com/anthropics/claude-code)"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=seat.tool_timeout_s) as r:
+            raw = r.read(2_000_000)
+            content_type = r.headers.get("Content-Type", "")
+            final_url = r.url
+    except Exception as e:
+        return ToolResult(
+            ok=False, content=f"fetch error: {e!r}", error="fetch_failed"
+        )
+
+    text = raw.decode(errors="replace")
+    is_html = "html" in content_type.lower() or "<html" in text[:1000].lower()
+    if is_html:
+        text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"&nbsp;", " ", text)
+        text = re.sub(r"&amp;", "&", text)
+        text = re.sub(r"&lt;", "<", text)
+        text = re.sub(r"&gt;", ">", text)
+        text = re.sub(r"&quot;", '"', text)
+        text = re.sub(r"&#39;", "'", text)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    MAX = 200_000
+    truncated = len(text) > MAX
+    if truncated:
+        text = text[:MAX] + "\n\n[... truncated]"
+    header = f"URL: {final_url}\nContent-Type: {content_type}\nBytes: {len(raw)}{' (truncated)' if truncated else ''}\n\n"
+    return ToolResult(ok=True, content=header + text)
+
+
 def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
     """Spawn a same-kind child: a copy of the parent's seat config at
     depth+1, with a fresh history starting from `prompt`. Bounded by
@@ -439,6 +580,38 @@ def register_builtins() -> None:
                 "required": ["result"],
             },
             handler=_h_submit,
+        )
+    )
+    register(
+        ToolSpec(
+            name="web_search",
+            description=(
+                "Search the web. Returns a short list of relevant results "
+                "(title, url, snippet) — fetch the URLs that look most "
+                "promising with web_fetch. Use specific queries with year "
+                "and entity names for fresh results."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+            handler=_h_web_search,
+        )
+    )
+    register(
+        ToolSpec(
+            name="web_fetch",
+            description=(
+                "Fetch the body of a URL (HTML is tag-stripped). Capped at "
+                "~200 KB. Use after web_search to read a specific source."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+            handler=_h_web_fetch,
         )
     )
     register(

@@ -106,23 +106,6 @@ def _build_tools_param(tool_specs: List[ToolSpec]) -> list:
     ]
 
 
-def _append_web_tools(tools_param: list, seat: Seat) -> list:
-    if not seat.web:
-        return tools_param
-    out = list(tools_param)
-    if "search" in seat.web:
-        out.append({
-            "type": "openrouter:web_search",
-            "openrouter:web_search": {
-                "max_results": seat.web_max_results,
-                "search_context_size": seat.web_search_context_size,
-            },
-        })
-    if "fetch" in seat.web:
-        out.append({"type": "openrouter:web_fetch"})
-    return out
-
-
 def _extract_citations_from(raw_anns) -> list:
     if not raw_anns:
         return []
@@ -167,16 +150,14 @@ def call_model(seat: Seat, tool_specs: List[ToolSpec], log: Log) -> ModelRespons
     NOT enforced — `max_turns` and `max_depth`/`max_children` are the caps."""
     system_content = _harness_preamble() + "\n" + seat.system_prompt
     messages = [{"role": "system", "content": system_content}] + list(seat.history)
-    local_tools = _build_tools_param(tool_specs)
-    tools_param = _append_web_tools(local_tools, seat)
+    tools_param = _build_tools_param(tool_specs)
     log.write(
         seat,
         "model_request",
         {
             "model": seat.model,
             "messages": messages,
-            "tools": [t["function"]["name"] for t in local_tools],
-            "web_tools": [t["type"] for t in tools_param if t.get("type", "").startswith("openrouter:")],
+            "tools": [t["function"]["name"] for t in tools_param],
             "provider_pref": list(seat.provider) if seat.provider else None,
         },
     )

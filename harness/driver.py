@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import List
 
-from .tools import RunCtx, adjudicate_and_run, get_specs
+from .tools import REGISTRY, RunCtx, adjudicate_and_run, get_specs
 from .types import Seat, ToolCall, ToolResult
 
 
@@ -57,8 +57,17 @@ def run_seat(seat: Seat, ctx: RunCtx) -> ToolResult:
                 )
                 return ToolResult(ok=False, content="max_turns exhausted", error="max_turns")
 
-            # 2. Model call.
+            # 2. Model call. Expand seat.web into native function tools
+            #    (web_search, web_fetch) — OpenRouter's `openrouter:web_*`
+            #    plugin tool types don't translate back cleanly with
+            #    several models (e.g. Kimi K2.6 leaks raw template
+            #    tokens into content). Native function tools work for
+            #    every model the harness supports.
             tool_specs = get_specs(seat.tools)
+            if "search" in seat.web and "web_search" in REGISTRY:
+                tool_specs.append(REGISTRY["web_search"])
+            if "fetch" in seat.web and "web_fetch" in REGISTRY:
+                tool_specs.append(REGISTRY["web_fetch"])
             resp = call_model(seat, tool_specs, ctx.log)
             seat.turns_used += 1
             seat.history.append(resp.raw_assistant_message)
