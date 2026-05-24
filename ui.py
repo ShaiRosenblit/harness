@@ -74,6 +74,13 @@ HELP_TEXT = """\
   [cyan]/approvals[/cyan]           list pending + resolved approvals for this run
   [cyan]/clear[/cyan] · [cyan]/help[/cyan] · [cyan]/quit[/cyan]
 
+[b]keys[/b]
+
+  [yellow]PageUp[/yellow] / [yellow]PageDown[/yellow]       scroll the output
+  [yellow]Ctrl+Home[/yellow] / [yellow]Ctrl+End[/yellow]    jump to top / bottom (End resumes live tail)
+  [yellow]Ctrl+L[/yellow]                clear the screen
+  [yellow]Tab[/yellow]                   accept autocomplete suggestion
+
 [b]flags[/b] (work with [cyan]/run[/cyan] and [cyan]/chat[/cyan])
 
   [yellow]--model[/yellow] [dim]<id>[/dim]              OpenRouter model id
@@ -343,6 +350,12 @@ class HarnessApp(App):
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("ctrl+l", "clear", "Clear"),
+        # Scrolling — mouse is off (so terminal copy/paste works) and the
+        # Input widget holds focus, so we route these to the output log.
+        Binding("pageup",      "scroll_up",     "↑ page"),
+        Binding("pagedown",    "scroll_down",   "↓ page"),
+        Binding("ctrl+home",   "scroll_top",    "top"),
+        Binding("ctrl+end",    "scroll_bottom", "bottom"),
     ]
 
     def __init__(self) -> None:
@@ -867,6 +880,33 @@ class HarnessApp(App):
 
     def action_clear(self) -> None:
         self._cmd_clear("")
+
+    # ---- scrolling ----------------------------------------------------- #
+    # When the user scrolls back through history, pause auto-scroll so
+    # incoming live entries don't yank them to the bottom mid-read.
+    # Scrolling all the way to the bottom (Ctrl+End) resumes it.
+
+    def action_scroll_up(self) -> None:
+        out = self.query_one("#output", RichLog)
+        out.auto_scroll = False
+        out.scroll_page_up()
+
+    def action_scroll_down(self) -> None:
+        out = self.query_one("#output", RichLog)
+        out.scroll_page_down()
+        # If they paged past the bottom, treat that as "resume live".
+        if out.is_vertical_scroll_end:
+            out.auto_scroll = True
+
+    def action_scroll_top(self) -> None:
+        out = self.query_one("#output", RichLog)
+        out.auto_scroll = False
+        out.scroll_home()
+
+    def action_scroll_bottom(self) -> None:
+        out = self.query_one("#output", RichLog)
+        out.scroll_end()
+        out.auto_scroll = True
 
 
 def main() -> int:
