@@ -1,11 +1,30 @@
 from __future__ import annotations
 
+import datetime as _dt
 import os
+import time as _time
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from .log import Log
 from .types import Seat, ToolSpec
+
+
+def _harness_preamble() -> str:
+    """Real-time context the model can rely on each turn: date, ISO timestamp,
+    timezone. Prepended to the system prompt on every model_request so the
+    agent never has to guess what 'today' is or how to date a search."""
+    now = _dt.datetime.now().astimezone()
+    return (
+        f"[harness context]\n"
+        f"  today: {now.date().isoformat()}\n"
+        f"  now:   {now.isoformat(timespec='seconds')}\n"
+        f"  tz:    {_time.tzname[_time.daylight]}\n"
+        f"Use this date when reasoning about anything time-sensitive. "
+        f"For time-sensitive web queries (latest, recent, current, "
+        f"today's, this week's, this year's, etc.), include today's "
+        f"year explicitly in the query so fresh results surface.\n"
+    )
 
 
 # ---- Normalized response shape ---------------------------------------------
@@ -142,7 +161,8 @@ def call_model(seat: Seat, tool_specs: List[ToolSpec], log: Log) -> ModelRespons
     calls OpenRouter, logs request and response, and accumulates the seat's
     observability counters (cost_usd, tokens_*, web_searches). Counters are
     NOT enforced — `max_turns` and `max_depth`/`max_children` are the caps."""
-    messages = [{"role": "system", "content": seat.system_prompt}] + list(seat.history)
+    system_content = _harness_preamble() + "\n" + seat.system_prompt
+    messages = [{"role": "system", "content": system_content}] + list(seat.history)
     local_tools = _build_tools_param(tool_specs)
     tools_param = _append_web_tools(local_tools, seat)
     log.write(
