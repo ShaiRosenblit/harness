@@ -150,8 +150,15 @@ def get_specs(names) -> list:
 
 def adjudicate_and_run(seat: Seat, call: ToolCall, ctx: RunCtx) -> ToolResult:
     """Capability check → schema check → execute → log. All in one place."""
-    # Capability check.
-    if call.name not in seat.tools:
+    # Capability check. seat.web (("search","fetch")) implicitly grants
+    # web_search / web_fetch (which the driver injects into the model's
+    # visible tool list); they don't appear in seat.tools.
+    allowed = set(seat.tools)
+    if "search" in seat.web:
+        allowed.add("web_search")
+    if "fetch" in seat.web:
+        allowed.add("web_fetch")
+    if call.name not in allowed:
         ctx.log.write(
             seat,
             "denial",
