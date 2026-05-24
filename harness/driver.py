@@ -66,27 +66,47 @@ def run_seat(seat: Seat, ctx: RunCtx) -> ToolResult:
             calls = _parse_tool_calls(resp.tool_calls)
 
             if not calls:
+                text = (resp.text or "").strip()
                 if chat_mode:
                     seat.halted = True
                     seat.halt_reason = "yield"
                     ctx.log.write(
                         seat,
                         "halt",
-                        {"reason": "yield", "text": (resp.text or "")[:500]},
+                        {"reason": "yield", "text": text[:500]},
                     )
                     return ToolResult(
-                        ok=True, content=(resp.text or ""), meta={"yield": True}
+                        ok=True, content=text, meta={"yield": True}
                     )
-                # Task mode: nudge the model to actually call a tool.
+                # Task mode + a real text response = the model effectively
+                # answered without calling submit. Treat the text as an
+                # implicit submit. This avoids the "agent calls a meaningless
+                # tool just to satisfy the no_tool_call nudge" failure mode
+                # we saw with chat-style messages ("hi", "what can you do?").
+                if text:
+                    seat.submit_result = text
+                    seat.halted = True
+                    seat.halt_reason = "submit"
+                    ctx.log.write(
+                        seat,
+                        "submit",
+                        {"result": text, "implicit": True},
+                    )
+                    ctx.log.write(seat, "halt", {"reason": "submit"})
+                    return ToolResult(
+                        ok=True, content=text,
+                        meta={"submitted": True, "implicit": True},
+                    )
+                # Genuinely empty response — nudge.
                 ctx.log.write(
                     seat,
                     "denial",
-                    {"reason": "no_tool_call", "text": (resp.text or "")[:500]},
+                    {"reason": "no_tool_call_empty"},
                 )
                 seat.history.append(
                     {
                         "role": "user",
-                        "content": "Please call a tool. If you are done, call submit().",
+                        "content": "Please call a tool or send a reply.",
                     }
                 )
                 continue
