@@ -225,7 +225,9 @@ def call_model(seat: Seat, tool_specs: List[ToolSpec], log: Log) -> ModelRespons
 
     usage = _extract_usage(getattr(completion, "usage", None))
     seat.cost_usd += usage["usd"]
-    seat.tokens_prompt += int(usage.get("prompt_tokens", 0) or 0)
+    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+    seat.tokens_prompt += prompt_tokens
+    seat.tokens_prompt_last = prompt_tokens
     seat.tokens_completion += int(usage.get("completion_tokens", 0) or 0)
 
     citations = _extract_citations(msg)
