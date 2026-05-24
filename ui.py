@@ -129,7 +129,15 @@ def parse_overrides(tokens: list[str]) -> tuple[dict, list[str]]:
 
 
 def apply_overrides(agent: Agent, overrides: dict) -> Agent:
-    """Build a new Agent with the given flag overrides applied."""
+    """Build a new Agent with the given flag overrides applied.
+
+    Also patches over an obvious foot-gun: if `spawn` is in the resulting
+    tools list but max_children or max_depth are zero (which makes spawn
+    instantly fail with breadth_exceeded / depth_exceeded), set them to
+    sensible defaults so commands like `/chat --tools spawn` just work.
+    The user can still override those with their own --max-children N
+    and --max-depth N flags.
+    """
     changes: dict = {}
     for k, v in overrides.items():
         if k == "model":
@@ -149,7 +157,17 @@ def apply_overrides(agent: Agent, overrides: dict) -> Agent:
             changes["max_children"] = int(v)
         else:
             raise ValueError(f"unknown flag: --{k}")
-    return replace(agent, **changes) if changes else agent
+    new_agent = replace(agent, **changes) if changes else agent
+
+    if "spawn" in new_agent.tools:
+        fix: dict = {}
+        if new_agent.max_children <= 0 and "max-children" not in overrides:
+            fix["max_children"] = 3
+        if new_agent.max_depth <= 0 and "max-depth" not in overrides:
+            fix["max_depth"] = 2
+        if fix:
+            new_agent = replace(new_agent, **fix)
+    return new_agent
 
 
 def summarize_entry(e: dict) -> str:

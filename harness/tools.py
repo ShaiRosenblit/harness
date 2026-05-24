@@ -210,11 +210,18 @@ def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
     # Critical section: breadth, child_count, child id mint, live seats.
     with ctx._spawn_lock:
         if seat.child_count >= seat.max_children:
-            return ToolResult(
-                ok=False,
-                content=f"breadth limit: already spawned {seat.child_count}",
-                error="breadth_exceeded",
-            )
+            if seat.max_children <= 0:
+                msg = (
+                    "spawn unavailable: this agent's max_children is 0. "
+                    "Relaunch with --max-children N (and --max-depth N if it's 0)."
+                )
+            else:
+                msg = (
+                    f"breadth limit: this agent's max_children={seat.max_children}, "
+                    f"already spawned {seat.child_count}. Relaunch with a higher "
+                    f"--max-children if you need more siblings."
+                )
+            return ToolResult(ok=False, content=msg, error="breadth_exceeded")
         seat.child_count += 1
         child_id = f"{seat.id}.{seat.child_count}"
         ctx.live_seats.add(child_id)
