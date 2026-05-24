@@ -42,25 +42,36 @@ _PASTE_MARKER_RE = re.compile(r"\[Pasted #(\d+) \+(\d+) lines\]")
 
 
 class SuggestingInput(Input):
-    """Input that accepts the suggester's ghost text on Tab (the default
-    keymap binds Tab to focus-next, which is useless when this is the only
-    interactive widget). Holds priority=True so it beats the App's default
-    Tab handling.
+    """Input with shell-like UX:
+       - Tab accepts the suggester's ghost-text suggestion.
+       - ↑ / ↓ navigate command history (most-recent first on first ↑).
+       - Multi-line pastes are stashed under a numbered `[Pasted #N +K lines]`
+         marker so the user can still edit around them; on submit the marker
+         expands back to the real text.
 
-    Multi-line paste: Textual's Input is single-line and would drop every
-    line after the first. We stash the full text under a numbered marker
-    `[Pasted #N +K lines]` so the user can still edit around it; on
-    submit the marker expands back to the real text.
+    History preserves paste markers and their content together — if the
+    user re-submits a recalled line with a paste marker in it, the marker
+    still expands correctly.
     """
 
     BINDINGS = [
-        Binding("tab", "cursor_right", "accept suggestion",
+        Binding("tab",  "cursor_right", "accept suggestion",
+                show=False, priority=True),
+        Binding("up",   "history_prev", "↑ history",
+                show=False, priority=True),
+        Binding("down", "history_next", "↓ history",
                 show=False, priority=True),
     ]
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._pastes: dict[int, str] = {}
+        # Command history. Each entry is (marker-form text, paste dict).
+        # _history_idx == len(history) means "current input" (live draft).
+        self._history: list[tuple[str, dict[int, str]]] = []
+        self._history_idx: int = 0
+        self._draft_value: str = ""
+        self._draft_pastes: dict[int, str] = {}
 
     def _on_paste(self, event: events.Paste) -> None:
         text = event.text or ""
@@ -82,14 +93,52 @@ class SuggestingInput(Input):
         event.stop()
 
     def consume(self) -> str:
-        """Return the current value with any paste markers expanded back
-        to their full text, and reset the input/paste store."""
-        def sub(m: re.Match[str]) -> str:
+        """Return the current value with paste markers expanded back to
+        their full text, push the line into history, and reset the input."""
+        def sub(m: "re.Match[str]") -> str:
             return self._pastes.get(int(m.group(1)), m.group(0))
         expanded = _PASTE_MARKER_RE.sub(sub, self.value)
+        # Save the *marker-form* line + its paste dict so navigating back
+        # to it later still resolves correctly.
+        if self.value and (not self._history or self._history[-1][0] != self.value):
+            self._history.append((self.value, dict(self._pastes)))
+        self._history_idx = len(self._history)
+        self._draft_value = ""
+        self._draft_pastes = {}
         self.value = ""
         self._pastes.clear()
         return expanded
+
+    # ---- history navigation ------------------------------------------- #
+
+    def action_history_prev(self) -> None:
+        if not self._history:
+            return
+        if self._history_idx == len(self._history):
+            # Snapshot the in-progress draft so ↓-back-to-now restores it.
+            self._draft_value = self.value
+            self._draft_pastes = dict(self._pastes)
+        if self._history_idx > 0:
+            self._history_idx -= 1
+            text, pastes = self._history[self._history_idx]
+            self.value = text
+            self._pastes = dict(pastes)
+            self.cursor_position = len(self.value)
+
+    def action_history_next(self) -> None:
+        if not self._history:
+            return
+        if self._history_idx < len(self._history):
+            self._history_idx += 1
+            if self._history_idx == len(self._history):
+                # Back at "now" — restore the live draft.
+                self.value = self._draft_value
+                self._pastes = dict(self._draft_pastes)
+            else:
+                text, pastes = self._history[self._history_idx]
+                self.value = text
+                self._pastes = dict(pastes)
+            self.cursor_position = len(self.value)
 
 
 RUNS_DIR = ROOT / "runs"
@@ -130,19 +179,17 @@ HELP_TEXT = """\
   [cyan]/approvals[/cyan]           list pending + resolved approvals for this run
   [cyan]/clear[/cyan] · [cyan]/help[/cyan] · [cyan]/quit[/cyan]
 
-[b]mouse + scroll[/b]
-
-  [yellow]Mouse wheel[/yellow]           scroll the output (via terminal alt-scroll mode)
-  [yellow]Drag to select[/yellow]        terminal-native text selection (no modifier needed)
-  [yellow]Cmd+C[/yellow] / [yellow]Ctrl+Shift+C[/yellow]   copy
-
 [b]keyboard[/b]
 
-  [yellow]PageUp[/yellow] / [yellow]PageDown[/yellow]       scroll a page
-  [yellow]↑[/yellow] / [yellow]↓[/yellow]                  scroll a line (also what the wheel sends)
+  [yellow]↑[/yellow] / [yellow]↓[/yellow]                  previous / next command (shell history)
+  [yellow]Tab[/yellow]                   accept autocomplete suggestion
+  [yellow]PageUp[/yellow] / [yellow]PageDown[/yellow]       scroll the output
   [yellow]Ctrl+Home[/yellow] / [yellow]Ctrl+End[/yellow]    top / bottom (End resumes live tail)
   [yellow]Ctrl+L[/yellow]                clear the screen
-  [yellow]Tab[/yellow]                   accept autocomplete suggestion
+
+[b]text selection[/b]
+
+  Drag to select. [yellow]Cmd+C[/yellow] / [yellow]Ctrl+Shift+C[/yellow] to copy. Terminal-native.
 
 [b]flags[/b] (work with [cyan]/run[/cyan] and [cyan]/chat[/cyan])
 
@@ -413,16 +460,12 @@ class HarnessApp(App):
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("ctrl+l", "clear", "Clear"),
-        # Mouse is off (so terminal copy/paste works). We enable terminal
-        # "alternate scroll mode" (?1007h) in on_mount, which makes the
-        # terminal translate wheel up/down into ↑/↓ keystrokes. We bind
-        # those plus PageUp/PageDown/Ctrl+Home/End to scroll the log.
-        Binding("up",          "scroll_one_up",   show=False, priority=True),
-        Binding("down",        "scroll_one_down", show=False, priority=True),
-        Binding("pageup",      "scroll_up",       "↑ page"),
-        Binding("pagedown",    "scroll_down",     "↓ page"),
-        Binding("ctrl+home",   "scroll_top",      "top"),
-        Binding("ctrl+end",    "scroll_bottom",   "bottom"),
+        # ↑/↓ are owned by SuggestingInput for command history (shell-like).
+        # Log scrolling uses PageUp/PageDown + Ctrl+Home/End instead.
+        Binding("pageup",    "scroll_up",     "↑ page"),
+        Binding("pagedown",  "scroll_down",   "↓ page"),
+        Binding("ctrl+home", "scroll_top",    "top"),
+        Binding("ctrl+end",  "scroll_bottom", "bottom"),
     ]
 
     def __init__(self) -> None:
@@ -462,11 +505,6 @@ class HarnessApp(App):
         self.query_one("#prompt", Input).focus()
         self.set_interval(0.5, self._tail_active_run)
         self.set_interval(0.4, self._check_pending_approvals)
-        # ?1007h = enable alternate-scroll-mode: terminal converts wheel
-        # events into ↑/↓ arrow keystrokes. Lets the wheel scroll the log
-        # while leaving normal mouse clicks/drags to the terminal for
-        # native text selection.
-        self._enable_alt_scroll()
 
     # ---- output ---------------------------------------------------------- #
 
@@ -963,17 +1001,6 @@ class HarnessApp(App):
     # incoming live entries don't yank them to the bottom mid-read.
     # Scrolling all the way to the bottom (Ctrl+End) resumes it.
 
-    def action_scroll_one_up(self) -> None:
-        out = self.query_one("#output", RichLog)
-        out.auto_scroll = False
-        out.scroll_up()
-
-    def action_scroll_one_down(self) -> None:
-        out = self.query_one("#output", RichLog)
-        out.scroll_down()
-        if out.is_vertical_scroll_end:
-            out.auto_scroll = True
-
     def action_scroll_up(self) -> None:
         out = self.query_one("#output", RichLog)
         out.auto_scroll = False
@@ -995,36 +1022,6 @@ class HarnessApp(App):
         out = self.query_one("#output", RichLog)
         out.scroll_end()
         out.auto_scroll = True
-
-    # ---- alt scroll mode (?1007h) -------------------------------------- #
-    # Lets the terminal translate mouse wheel events into ↑/↓ arrow keys
-    # while leaving clicks/drags to the terminal (so native text selection
-    # keeps working). Supported by xterm, iTerm2, gnome-terminal, kitty,
-    # alacritty, wezterm. Terminal.app supports it but the default profile
-    # may have it off — most users won't need to change anything.
-
-    def _enable_alt_scroll(self) -> None:
-        self._write_raw("\x1b[?1007h")
-
-    def _disable_alt_scroll(self) -> None:
-        self._write_raw("\x1b[?1007l")
-
-    def _write_raw(self, seq: str) -> None:
-        try:
-            self._driver.write(seq)
-            self._driver.flush()
-        except Exception:
-            # Fallback: try stdout. Worst case the escape goes nowhere
-            # and we silently lose the feature.
-            try:
-                import sys
-                sys.stdout.write(seq)
-                sys.stdout.flush()
-            except Exception:
-                pass
-
-    def on_unmount(self) -> None:
-        self._disable_alt_scroll()
 
 
 def main() -> int:
