@@ -36,6 +36,18 @@ from textual.suggester import Suggester  # noqa: E402
 from textual.widgets import Footer, Header, Input, RichLog  # noqa: E402
 
 
+class SuggestingInput(Input):
+    """Input that accepts the suggester's ghost text on Tab (the default
+    keymap binds Tab to focus-next, which is useless when this is the only
+    interactive widget). Holds priority=True so it beats the App's default
+    Tab handling."""
+
+    BINDINGS = [
+        Binding("tab", "cursor_right", "accept suggestion",
+                show=False, priority=True),
+    ]
+
+
 RUNS_DIR = ROOT / "runs"
 AGENTS_DIR = ROOT / "agents"
 
@@ -76,10 +88,17 @@ HELP_TEXT = """\
 
 [b]keys[/b]
 
+  [yellow]Mouse wheel[/yellow]           scroll the output
   [yellow]PageUp[/yellow] / [yellow]PageDown[/yellow]       scroll the output
   [yellow]Ctrl+Home[/yellow] / [yellow]Ctrl+End[/yellow]    jump to top / bottom (End resumes live tail)
   [yellow]Ctrl+L[/yellow]                clear the screen
   [yellow]Tab[/yellow]                   accept autocomplete suggestion
+
+[b]text selection[/b]
+
+  Hold [yellow]⌥ Option[/yellow] (macOS) or [yellow]Shift[/yellow] (Linux) while dragging to let
+  the terminal do native text selection. Without the modifier the
+  mouse goes to the app (for scrolling).
 
 [b]flags[/b] (work with [cyan]/run[/cyan] and [cyan]/chat[/cyan])
 
@@ -371,7 +390,7 @@ class HarnessApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         yield RichLog(id="output", highlight=True, markup=True, wrap=True)
-        yield Input(
+        yield SuggestingInput(
             placeholder="type a message to chat, or /help for commands  (tab to accept suggestion)",
             id="prompt",
             suggester=HarnessSuggester(),
@@ -910,11 +929,11 @@ class HarnessApp(App):
 
 
 def main() -> int:
-    # mouse=False disables Textual's mouse capture so your terminal's
-    # native text selection (and copy/paste) works normally. The cost is
-    # that mouse clicks inside the app do nothing — but the UI is
-    # keyboard-driven anyway.
-    HarnessApp().run(mouse=False)
+    # Mouse capture ON so the scroll wheel works on the output area.
+    # Terminal-native text selection still works while holding Option (⌥)
+    # on macOS or Shift on Linux — that's the standard "let the terminal
+    # see the mouse" modifier in iTerm2, Terminal.app and gnome-terminal.
+    HarnessApp().run()
     return 0
 
 
