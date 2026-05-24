@@ -900,7 +900,7 @@ class HarnessApp(App):
         if self._is_running:
             self._line("[yellow]busy[/yellow] — wait for the current turn to finish")
             return
-        self._line(f"[b cyan]you[/b cyan]  {user_text}")
+        self._line(f"[dim]{time.strftime('%H:%M:%S')}[/dim]  [b cyan]you[/b cyan]  {user_text}")
         self._is_running = True
         self.run_worker(self._do_chat_turn(user_text), exclusive=True, group="chat", thread=True)
 
@@ -920,7 +920,7 @@ class HarnessApp(App):
     def _on_chat_reply(self, reply: str) -> None:
         self._tail_active_run()
         if reply:
-            self._line(f"[b green]agent[/b green]  {reply}")
+            self._line(f"[dim]{time.strftime('%H:%M:%S')}[/dim]  [b green]agent[/b green]  {reply}")
         self._is_running = False
 
     # ---- /run ----------------------------------------------------------- #
