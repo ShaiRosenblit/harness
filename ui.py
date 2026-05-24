@@ -151,7 +151,7 @@ COMMANDS = (
     "help", "login", "logout", "status", "model",
     "agents", "skills", "runs", "view", "tree",
     "chat", "end", "run",
-    "approve", "deny", "approvals",
+    "approve", "deny", "approvals", "auto",
     "clear", "quit", "exit",
 )
 
@@ -177,6 +177,7 @@ HELP_TEXT = """\
   [cyan]/approve[/cyan] [dim]<id>[/dim]    approve a pending risky tool call
   [cyan]/deny[/cyan] [dim]<id>[/dim]       deny a pending risky tool call
   [cyan]/approvals[/cyan]           list pending + resolved approvals for this run
+  [cyan]/auto[/cyan] [dim]on|off[/dim]      session-wide auto-approve (risky tools run without prompting)
   [cyan]/clear[/cyan] · [cyan]/help[/cyan] · [cyan]/quit[/cyan]
 
 [b]keyboard[/b]
@@ -199,6 +200,7 @@ HELP_TEXT = """\
   [yellow]--max-turns[/yellow] [dim]N[/dim]             per-seat turn cap
   [yellow]--max-depth[/yellow] [dim]N[/dim]             spawn-recursion depth
   [yellow]--max-children[/yellow] [dim]N[/dim]          siblings per seat
+  [yellow]--auto-approve[/yellow]            run risky tools without prompting (per-run)
 """
 
 
@@ -229,15 +231,22 @@ def load_agent(name: str) -> Agent:
     return getattr(mod, "AGENT")
 
 
+BOOLEAN_FLAGS = {"auto-approve"}
+
+
 def parse_overrides(tokens: list[str]) -> tuple[dict, list[str]]:
     """Pull leading `--flag value` (or `--flag=value`) pairs off `tokens`.
-    Returns (overrides_dict, remaining_tokens)."""
+    Boolean flags in BOOLEAN_FLAGS don't take a value — their presence
+    means True. Returns (overrides_dict, remaining_tokens)."""
     out: dict = {}
     i = 0
     while i < len(tokens) and tokens[i].startswith("--"):
         raw = tokens[i].lstrip("-")
         if "=" in raw:
             key, value = raw.split("=", 1)
+            i += 1
+        elif raw in BOOLEAN_FLAGS:
+            key, value = raw, "true"
             i += 1
         else:
             key = raw
@@ -477,6 +486,9 @@ class HarnessApp(App):
         self._chat = None
         self._chat_agent_name: Optional[str] = None
         self._run_ctx = None   # set by the run worker before driver starts
+        # Session-wide auto-approve toggle. Off by default; opt in with
+        # `/auto on` or a per-run `--auto-approve` flag.
+        self._auto_approve: bool = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -587,15 +599,18 @@ class HarnessApp(App):
         )
         if self._chat is not None:
             seat = self._chat.seat
+            auto = " [red](auto-approve ON)[/red]" if self._chat.ctx.auto_approve else ""
             self._line(
                 f"chat: [green]active[/green]   agent=[b]{self._chat_agent_name}[/b]   "
                 f"turns=[b]{seat.turns_used}[/b]   "
                 f"tokens=[b]{seat.tokens_prompt}[/b]/[b]{seat.tokens_completion}[/b]   "
                 f"spent=$[b]{seat.cost_usd:.4f}[/b]   "
-                f"searches=[b]{seat.web_searches}[/b]"
+                f"searches=[b]{seat.web_searches}[/b]{auto}"
             )
         else:
             self._line("chat: [dim]inactive[/dim]")
+        auto_state = "[red]ON[/red]" if self._auto_approve else "[dim]off[/dim]"
+        self._line(f"auto-approve (session default): {auto_state}")
         self._line(f"runs dir: [dim]{RUNS_DIR}[/dim]")
         self._line(f"credentials: [dim]{credentials.CREDENTIALS_PATH}[/dim]")
 
@@ -719,6 +734,30 @@ class HarnessApp(App):
         except Exception:
             pass
 
+    def _cmd_auto(self, rest: str) -> None:
+        """Toggle session-wide auto-approve: skips approval prompts for
+        risky tools (e.g. bash). Off by default. Per-run override:
+        `--auto-approve` on /run or /chat. State here applies to NEW
+        runs/chats; the active chat's setting is locked in at /chat
+        time."""
+        rest = rest.strip().lower()
+        if rest in ("on", "true", "yes", "1"):
+            self._auto_approve = True
+            self._line(
+                "[red]⚠ session auto-approve ON.[/red] Risky tools (bash, …) "
+                "will run WITHOUT prompting on new runs/chats. "
+                "Use [cyan]/auto off[/cyan] to require approval again."
+            )
+        elif rest in ("off", "false", "no", "0"):
+            self._auto_approve = False
+            self._line("session auto-approve [green]OFF[/green] — risky tools require approval.")
+        elif rest == "":
+            state = "[red]ON[/red]" if self._auto_approve else "[green]off[/green]"
+            self._line(f"session auto-approve: {state}")
+            self._line("usage: [cyan]/auto on[/cyan]  ·  [cyan]/auto off[/cyan]")
+        else:
+            self._line(f"[red]unknown:[/red] /auto {rest!r} — try [cyan]/auto on|off[/cyan]")
+
     def _cmd_approve(self, rest: str) -> None:
         self._resolve_approval(rest.strip(), "approve")
 
@@ -798,6 +837,14 @@ class HarnessApp(App):
             return
         credentials.inject_env()
 
+        # Pull auto-approve out before applying overrides to the Agent
+        # config (it's a runtime flag, not an Agent field).
+        per_run_auto = overrides.pop("auto-approve", None)
+        auto_approve = (
+            self._auto_approve if per_run_auto is None
+            else per_run_auto.lower() in ("1", "true", "yes", "on")
+        )
+
         try:
             agent = load_agent(agent_name)
             agent = apply_overrides(agent, overrides)
@@ -813,14 +860,21 @@ class HarnessApp(App):
             shutil.rmtree(run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        self._chat = start_chat(agent=agent, log_path=run_dir / "log.jsonl", workdir=run_dir / "wd")
+        self._chat = start_chat(
+            agent=agent,
+            log_path=run_dir / "log.jsonl",
+            workdir=run_dir / "wd",
+            auto_approve=auto_approve,
+        )
         self._chat_agent_name = agent_name
         self._active_run = run_dir / "log.jsonl"
         self._active_seen_seq = 0
+        auto_note = "  [red](auto-approve ON)[/red]" if auto_approve else ""
         self._line(
             f"[b green]chat started[/b green]   agent=[cyan]{agent_name}[/cyan]  "
             f"model=[b]{agent.model}[/b]  tools={list(agent.tools)}  "
             + (f"web={list(agent.web)}" if agent.web else "")
+            + auto_note
         )
         self._line(f"[dim]   {run_dir}[/dim]")
         self._line("[dim]type a message (no /), or [/dim][cyan]/end[/cyan][dim] to stop.[/dim]")
@@ -905,6 +959,12 @@ class HarnessApp(App):
             return
         credentials.inject_env()
 
+        per_run_auto = overrides.pop("auto-approve", None)
+        auto_approve = (
+            self._auto_approve if per_run_auto is None
+            else per_run_auto.lower() in ("1", "true", "yes", "on")
+        )
+
         try:
             agent = load_agent(agent_name)
             agent = apply_overrides(agent, overrides)
@@ -920,18 +980,23 @@ class HarnessApp(App):
             shutil.rmtree(run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
 
+        auto_note = "  [red](auto-approve ON)[/red]" if auto_approve else ""
         self._line(
             f"[b]→ running[/b] [cyan]{agent_name}[/cyan]  model=[b]{agent.model}[/b]  "
             f"tools={list(agent.tools)}"
             + (f"  web={list(agent.web)}" if agent.web else "")
+            + auto_note
         )
         self._line(f"[dim]   {run_dir}[/dim]")
         self._active_run = run_dir / "log.jsonl"
         self._active_seen_seq = 0
         self._is_running = True
-        self.run_worker(self._do_run(agent, run_dir, message), exclusive=True, group="run", thread=True)
+        self.run_worker(
+            self._do_run(agent, run_dir, message, auto_approve),
+            exclusive=True, group="run", thread=True,
+        )
 
-    async def _do_run(self, agent: Agent, run_dir: Path, message: str) -> None:
+    async def _do_run(self, agent: Agent, run_dir: Path, message: str, auto_approve: bool = False) -> None:
         try:
             def grab_ctx(ctx):
                 self._run_ctx = ctx
@@ -941,6 +1006,7 @@ class HarnessApp(App):
                 workdir=run_dir / "wd",
                 user_message=message,
                 on_ctx=grab_ctx,
+                auto_approve=auto_approve,
             )
             seat = res.root_seat
             summary = (

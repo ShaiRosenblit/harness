@@ -51,6 +51,10 @@ class RunCtx:
     _approvals: Dict[str, ApprovalRequest] = field(default_factory=dict)
     _approval_seq: int = 0
     _approvals_lock: threading.Lock = field(default_factory=threading.Lock)
+    # When True, risky tool calls run WITHOUT prompting the user. The
+    # call is still logged (with auto=True) so it's auditable. Default
+    # off — opting in is a deliberate choice for trusted workloads.
+    auto_approve: bool = False
 
     def executor(self) -> ThreadPoolExecutor:
         if self._executor is None:
@@ -195,40 +199,53 @@ def adjudicate_and_run(seat: Seat, call: ToolCall, ctx: RunCtx) -> ToolResult:
         {"tool": call.name, "args": call.args, "call_id": call.id},
     )
 
-    # Approval gate for risky tools. Blocks the worker thread until the
-    # user types /approve <id> or /deny <id> in the UI.
+    # Approval gate for risky tools.
     if spec.risky:
-        req = ctx.request_approval(seat.id, call.name, call.args or {})
-        ctx.log.write(
-            seat,
-            "approval_request",
-            {"approval_id": req.id, "tool": call.name, "args": call.args, "call_id": call.id},
-        )
-        req.event.wait()   # ← blocks here until UI resolves
-        ctx.log.write(
-            seat,
-            "approval_decision",
-            {"approval_id": req.id, "decision": req.decision, "tool": call.name},
-        )
-        if req.decision != "approve":
-            result = ToolResult(
-                ok=False,
-                content=f"denied by user (approval {req.id})",
-                error="denied",
-            )
+        if ctx.auto_approve:
+            # Auto-approve: log it for auditability, then proceed without
+            # blocking on the user.
             ctx.log.write(
                 seat,
-                "tool_result",
+                "approval_decision",
                 {
+                    "decision": "approve",
+                    "auto": True,
                     "tool": call.name,
                     "call_id": call.id,
-                    "ok": False,
-                    "error": "denied",
-                    "content": result.content,
-                    "meta": {},
                 },
             )
-            return result
+        else:
+            req = ctx.request_approval(seat.id, call.name, call.args or {})
+            ctx.log.write(
+                seat,
+                "approval_request",
+                {"approval_id": req.id, "tool": call.name, "args": call.args, "call_id": call.id},
+            )
+            req.event.wait()   # ← blocks here until UI resolves
+            ctx.log.write(
+                seat,
+                "approval_decision",
+                {"approval_id": req.id, "decision": req.decision, "tool": call.name},
+            )
+            if req.decision != "approve":
+                result = ToolResult(
+                    ok=False,
+                    content=f"denied by user (approval {req.id})",
+                    error="denied",
+                )
+                ctx.log.write(
+                    seat,
+                    "tool_result",
+                    {
+                        "tool": call.name,
+                        "call_id": call.id,
+                        "ok": False,
+                        "error": "denied",
+                        "content": result.content,
+                        "meta": {},
+                    },
+                )
+                return result
 
     try:
         result = spec.handler(seat, call.args, ctx)

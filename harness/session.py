@@ -43,14 +43,23 @@ class ChatSession:
         self.ctx.log.close()
 
 
-def start_chat(agent: Agent, log_path: Path, workdir: Path) -> ChatSession:
-    """Create a fresh chat session."""
+def start_chat(
+    agent: Agent,
+    log_path: Path,
+    workdir: Path,
+    auto_approve: bool = False,
+) -> ChatSession:
+    """Create a fresh chat session.
+
+    `auto_approve=True` runs risky tools without prompting the user.
+    Default off.
+    """
     log_path = Path(log_path)
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
     log = Log(log_path)
-    ctx = RunCtx(log=log, workdir=workdir, agent=agent)
+    ctx = RunCtx(log=log, workdir=workdir, agent=agent, auto_approve=auto_approve)
     seat = mint_seat(agent=agent, seat_id="s0", parent_id=None, depth=0, history=[])
     return ChatSession(
         seat=seat,

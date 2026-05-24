@@ -23,19 +23,23 @@ def run_forest(
     workdir: Path,
     user_message: str,
     on_ctx: Optional[Callable[[RunCtx], None]] = None,
+    auto_approve: bool = False,
 ) -> ForestResult:
     """Top-level entrypoint: mint the root seat from `agent` and run it.
 
     `on_ctx` is invoked with the freshly-built RunCtx before the driver
     starts, so a caller (e.g. the UI) can hold a reference for displaying
     pending approvals while the worker is blocked.
+
+    `auto_approve=True` runs risky tools (e.g. bash) without prompting
+    the user. Default off.
     """
     log_path = Path(log_path)
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
     log = Log(log_path)
-    ctx = RunCtx(log=log, workdir=workdir, agent=agent)
+    ctx = RunCtx(log=log, workdir=workdir, agent=agent, auto_approve=auto_approve)
     if on_ctx is not None:
         on_ctx(ctx)
 
