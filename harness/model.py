@@ -123,13 +123,7 @@ def _append_web_tools(tools_param: list, seat: Seat) -> list:
     return out
 
 
-def _extract_citations(msg: Any) -> list:
-    raw_anns = getattr(msg, "annotations", None)
-    if raw_anns is None:
-        try:
-            raw_anns = msg.model_dump().get("annotations")
-        except Exception:
-            raw_anns = None
+def _extract_citations_from(raw_anns) -> list:
     if not raw_anns:
         return []
     cites: list = []
@@ -151,6 +145,16 @@ def _extract_citations(msg: Any) -> list:
                 "end_index": uc.get("end_index"),
             })
     return cites
+
+
+def _extract_citations(msg: Any) -> list:
+    raw_anns = getattr(msg, "annotations", None)
+    if raw_anns is None:
+        try:
+            raw_anns = msg.model_dump().get("annotations")
+        except Exception:
+            raw_anns = None
+    return _extract_citations_from(raw_anns)
 
 
 # ---- The single chokepoint -------------------------------------------------
@@ -191,56 +195,126 @@ def call_model(seat: Seat, tool_specs: List[ToolSpec], log: Log) -> ModelRespons
             "allow_fallbacks": False,
         }
 
-    completion = _client().chat.completions.create(
+    # Stream the response. Non-streaming responses from OpenRouter are
+    # padded with whitespace keepalive lines while the upstream provider
+    # is generating; for slow/long requests this can result in a truncated
+    # body that json.loads chokes on ("Expecting value: line N column 1").
+    # In streaming mode those keepalives are proper SSE comments
+    # (`: OPENROUTER PROCESSING`) that the SDK's SSE parser ignores.
+    stream = _client().chat.completions.create(
         model=seat.model,
         messages=messages,
         tools=tools_param if tools_param else None,
         tool_choice="auto" if tools_param else None,
+        stream=True,
+        stream_options={"include_usage": True},
         extra_body=extra_body,
     )
-    msg = completion.choices[0].message
-    provider_used = getattr(completion, "provider", None)
-    raw_msg: dict = {"role": "assistant", "content": msg.content}
-    tcs: List[ModelToolCall] = []
-    if getattr(msg, "tool_calls", None):
-        raw_tcs = []
-        for tc in msg.tool_calls:
-            tcs.append(
-                ModelToolCall(
-                    id=tc.id,
-                    name=tc.function.name,
-                    arguments_json=tc.function.arguments or "{}",
-                )
+
+    content_parts: list = []
+    reasoning_parts: list = []
+    tool_calls_by_index: dict = {}   # idx -> {"id", "name", "args_parts"}
+    annotations_raw: list = []
+    usage_obj: Any = None
+    provider_used: Optional[str] = None
+    final_msg_obj: Any = None        # for citation extraction fallback
+
+    for chunk in stream:
+        if not provider_used:
+            # OpenRouter puts the actual upstream provider name in the
+            # `provider` field of each chunk. Read it from model_extra so
+            # we don't accidentally pick up an SDK-side default attribute.
+            chunk_extras = getattr(chunk, "model_extra", None) or {}
+            provider_used = chunk_extras.get("provider")
+        if getattr(chunk, "usage", None):
+            usage_obj = chunk.usage
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+        choice = choices[0]
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            continue
+        # Some providers attach the final assembled message on the last
+        # choice; keep a reference so we can re-use _extract_citations.
+        msg_on_choice = getattr(choice, "message", None)
+        if msg_on_choice is not None:
+            final_msg_obj = msg_on_choice
+
+        if getattr(delta, "content", None):
+            content_parts.append(delta.content)
+
+        # Reasoning (Kimi K2.6 et al.) arrives separately on delta.reasoning,
+        # not in content. Capture it for the log; don't pass it back to the
+        # caller (the driver only acts on content + tool_calls).
+        extras = getattr(delta, "model_extra", None) or {}
+        r = extras.get("reasoning")
+        if r:
+            reasoning_parts.append(r)
+
+        # Annotations (web citations) may arrive on a delta, on a
+        # constructed message, or as a top-level chunk attribute.
+        for src in (delta, msg_on_choice):
+            anns = getattr(src, "annotations", None) if src is not None else None
+            if anns:
+                for a in anns:
+                    annotations_raw.append(a)
+
+        for tc in getattr(delta, "tool_calls", None) or []:
+            idx = getattr(tc, "index", 0) or 0
+            entry = tool_calls_by_index.setdefault(
+                idx, {"id": None, "name": None, "args_parts": []}
             )
+            if getattr(tc, "id", None) and not entry["id"]:
+                entry["id"] = tc.id
+            fn = getattr(tc, "function", None)
+            if fn is not None:
+                if getattr(fn, "name", None) and not entry["name"]:
+                    entry["name"] = fn.name
+                if getattr(fn, "arguments", None):
+                    entry["args_parts"].append(fn.arguments)
+
+    content = "".join(content_parts) if content_parts else None
+    raw_msg: dict = {"role": "assistant", "content": content}
+    tcs: List[ModelToolCall] = []
+    if tool_calls_by_index:
+        raw_tcs = []
+        for idx in sorted(tool_calls_by_index.keys()):
+            e = tool_calls_by_index[idx]
+            args_json = "".join(e["args_parts"]) or "{}"
+            call_id = e["id"] or f"call_{idx}"
+            name = e["name"] or ""
+            tcs.append(ModelToolCall(id=call_id, name=name, arguments_json=args_json))
             raw_tcs.append(
                 {
-                    "id": tc.id,
+                    "id": call_id,
                     "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments or "{}",
-                    },
+                    "function": {"name": name, "arguments": args_json},
                 }
             )
         raw_msg["tool_calls"] = raw_tcs
 
-    usage = _extract_usage(getattr(completion, "usage", None))
+    usage = _extract_usage(usage_obj)
     seat.cost_usd += usage["usd"]
     seat.tokens_prompt += int(usage.get("prompt_tokens", 0) or 0)
     seat.tokens_completion += int(usage.get("completion_tokens", 0) or 0)
 
-    citations = _extract_citations(msg)
+    citations = _extract_citations_from(annotations_raw)
+    if not citations and final_msg_obj is not None:
+        citations = _extract_citations(final_msg_obj)
     if citations:
         seat.web_searches += len(citations)
         raw_msg["annotations"] = [
             {"type": "url_citation", "url_citation": c} for c in citations
         ]
 
+    reasoning_text = "".join(reasoning_parts) if reasoning_parts else None
     log.write(
         seat,
         "model_response",
         {
-            "text": msg.content,
+            "text": content,
+            "reasoning": reasoning_text,
             "tool_calls": [
                 {"id": tc.id, "name": tc.name, "arguments": tc.arguments_json}
                 for tc in tcs
@@ -252,5 +326,5 @@ def call_model(seat: Seat, tool_specs: List[ToolSpec], log: Log) -> ModelRespons
         },
     )
     return ModelResponse(
-        text=msg.content, tool_calls=tcs, raw_assistant_message=raw_msg
+        text=content, tool_calls=tcs, raw_assistant_message=raw_msg
     )
