@@ -91,6 +91,28 @@ def run_seat(seat: Seat, ctx: RunCtx) -> ToolResult:
                 # implicit submit. This avoids the "agent calls a meaningless
                 # tool just to satisfy the no_tool_call nudge" failure mode
                 # we saw with chat-style messages ("hi", "what can you do?").
+                #
+                # Autonomous agents opt out: their prose is inner monologue,
+                # and the only legitimate user-facing channel is an explicit
+                # submit() call. Nudge them back into the loop.
+                if text and seat.autonomous:
+                    ctx.log.write(
+                        seat,
+                        "denial",
+                        {"reason": "text_without_submit_autonomous",
+                         "text_preview": text[:200]},
+                    )
+                    seat.history.append({
+                        "role": "user",
+                        "content": (
+                            "Inner thinking noted but not delivered. Plain "
+                            "text is your private monologue. To address the "
+                            "Principal — escalations, status digests, "
+                            "anything user-facing — call submit(<message>). "
+                            "Otherwise continue with a tool call."
+                        ),
+                    })
+                    continue
                 if text:
                     seat.submit_result = text
                     seat.halted = True

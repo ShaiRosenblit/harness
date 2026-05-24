@@ -52,6 +52,7 @@ class Seat:
     tool_timeout_s: float
     web_max_results: int
     web_search_context_size: str
+    autonomous: bool = False
     history: list = field(default_factory=list)
     turns_used: int = 0
     child_count: int = 0
@@ -95,3 +96,9 @@ class Agent:
     web: Tuple[str, ...] = ()   # subset of: search, fetch  (resolved by OpenRouter)
     web_max_results: int = 4
     web_search_context_size: str = "low"   # "low" | "medium" | "high"
+    # When True, a text-only model response is treated as inner thinking
+    # (loop continues) instead of an implicit submit. The only way to
+    # surface text to the user becomes an explicit submit() call. Use
+    # this for long-running autonomous loops that shouldn't halt the
+    # moment the model emits prose.
+    autonomous: bool = False
