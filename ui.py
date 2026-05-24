@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Interactive shell for the harness — a CLI-style UI built on Textual.
+"""Interactive shell for the harness.
 
-One scrolling output area on top, one prompt at the bottom. All actions are
-slash-commands. Type /help for the list.
+Single output area on top, command prompt at the bottom. Slash commands
+do everything; plain text without a `/` is sent as a chat message.
 
-First run:  /login <key>     stores your OpenRouter key (0600) so future
-                             launches and CLI tests skip authentication.
-
-Then:       /run <policy> [--model M] <user message...>
+First launch:  /login <openrouter-api-key>
+After login:   /run <agent> <message>    one-shot task
+               /chat [agent]             start a chat
+               just type                 auto-starts a chat
 """
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT))
 from harness import credentials  # noqa: E402
 from harness.forest import run_forest  # noqa: E402
 from harness.session import start_chat  # noqa: E402
+from harness.types import Agent  # noqa: E402
 
 from textual.app import App, ComposeResult  # noqa: E402
 from textual.binding import Binding  # noqa: E402
@@ -36,61 +37,48 @@ from textual.widgets import Footer, Header, Input, RichLog  # noqa: E402
 
 
 RUNS_DIR = ROOT / "runs"
-POLICIES_DIR = ROOT / "policies"
+AGENTS_DIR = ROOT / "agents"
 
 DEFAULT_MODEL = "moonshotai/kimi-k2.6"
+DEFAULT_CHAT_AGENT = "chat"
 
-
-# Slash commands available in the UI. Kept alongside DEFAULT_MODEL so the
-# suggester picks them up; `_dispatch` actually resolves them via `_cmd_<name>`.
 COMMANDS = (
     "help", "login", "logout", "status", "model",
-    "policies", "runs", "view", "tree",
+    "agents", "runs", "view", "tree",
     "chat", "end", "run",
     "clear", "quit", "exit",
 )
 
+HELP_TEXT = """\
+[b]how to use[/b]
 
-class HarnessSuggester(Suggester):
-    """Context-aware completer for the prompt input.
+  Just type a message — a chat with the [cyan]chat[/cyan] agent starts.
+  Type [cyan]/end[/cyan] to end the chat.
 
-    - top-level: completes "/cmd" from COMMANDS
-    - "/run <pol>" / "/chat <pol>": completes from policies/*.py
-    - "/view <run>" / "/tree <run>": completes from runs/* directories
-    """
+[b]commands[/b]
 
-    def __init__(self) -> None:
-        super().__init__(case_sensitive=False, use_cache=False)
+  [cyan]/login[/cyan] [dim]<key>[/dim]         sign in (saves your OpenRouter API key, 0600)
+  [cyan]/logout[/cyan]              clear the saved key
+  [cyan]/status[/cyan]              auth, default model, chat state
+  [cyan]/model[/cyan] [dim]<id|->[/dim]       session model override (or `-` to clear)
+  [cyan]/agents[/cyan]              list available agents
+  [cyan]/runs[/cyan]                list past runs
+  [cyan]/view[/cyan] [dim]<run>[/dim]          replay a run's timeline
+  [cyan]/tree[/cyan] [dim]<run>[/dim]          show a run's seat tree
+  [cyan]/chat[/cyan] [dim][agent] [flags...][/dim]              start a chat (default: chat)
+  [cyan]/end[/cyan]                 end the current chat
+  [cyan]/run[/cyan]  [dim]<agent> [flags...] <message...>[/dim]  one-shot task
+  [cyan]/clear[/cyan] · [cyan]/help[/cyan] · [cyan]/quit[/cyan]
 
-    async def get_suggestion(self, value: str) -> Optional[str]:
-        if not value or not value.startswith("/"):
-            return None
-        # Command name (no space yet)
-        if " " not in value:
-            stem = value[1:].lower()
-            if not stem:
-                return None
-            for name in COMMANDS:
-                if name.startswith(stem):
-                    return "/" + name
-            return None
-        # Subcommand argument
-        head, _, rest = value.partition(" ")
-        cmd = head[1:].lower()
-        # Only complete first arg (i.e. one space, no further spaces yet)
-        if " " in rest:
-            return None
-        if cmd in ("run", "chat"):
-            for p in list_policies():
-                if p.startswith(rest):
-                    return f"{head} {p}"
-            return None
-        if cmd in ("view", "tree"):
-            for r in list_runs():
-                if r.name.startswith(rest):
-                    return f"{head} {r.name}"
-            return None
-        return None
+[b]flags[/b] (work with [cyan]/run[/cyan] and [cyan]/chat[/cyan])
+
+  [yellow]--model[/yellow] [dim]<id>[/dim]              OpenRouter model id
+  [yellow]--tools[/yellow] [dim]a,b,c[/dim]             local tools (code_exec, submit, spawn)
+  [yellow]--web[/yellow] [dim]search,fetch[/dim]        enable OpenRouter web tools
+  [yellow]--max-turns[/yellow] [dim]N[/dim]             per-seat turn cap
+  [yellow]--max-depth[/yellow] [dim]N[/dim]             spawn-recursion depth
+  [yellow]--max-children[/yellow] [dim]N[/dim]          siblings per seat
+"""
 
 
 # --------------------------------------------------------------------------- #
@@ -98,9 +86,9 @@ class HarnessSuggester(Suggester):
 # --------------------------------------------------------------------------- #
 
 
-def list_policies() -> list[str]:
+def list_agents() -> list[str]:
     return sorted(
-        p.stem for p in POLICIES_DIR.glob("*.py") if not p.name.startswith("_")
+        p.stem for p in AGENTS_DIR.glob("*.py") if not p.name.startswith("_")
     )
 
 
@@ -114,46 +102,78 @@ def list_runs() -> list[Path]:
     )
 
 
-def load_policy(module_name: str):
+def load_agent(name: str) -> Agent:
     import importlib
-    mod = importlib.import_module(f"policies.{module_name}")
-    return getattr(mod, "POLICY")
+    mod = importlib.import_module(f"agents.{name}")
+    return getattr(mod, "AGENT")
 
 
-def with_model_override(policy, model: Optional[str]):
-    """Return a copy of `policy` with model swapped (and child_policy too)."""
-    if not model:
-        return policy
-    child = policy.child_policy
-    if child is not None:
-        child = replace(child, model=model)
-    return replace(policy, model=model, child_policy=child)
+def parse_overrides(tokens: list[str]) -> tuple[dict, list[str]]:
+    """Pull leading `--flag value` (or `--flag=value`) pairs off `tokens`.
+    Returns (overrides_dict, remaining_tokens)."""
+    out: dict = {}
+    i = 0
+    while i < len(tokens) and tokens[i].startswith("--"):
+        raw = tokens[i].lstrip("-")
+        if "=" in raw:
+            key, value = raw.split("=", 1)
+            i += 1
+        else:
+            key = raw
+            if i + 1 >= len(tokens):
+                raise ValueError(f"missing value for --{key}")
+            value = tokens[i + 1]
+            i += 2
+        out[key] = value
+    return out, tokens[i:]
+
+
+def apply_overrides(agent: Agent, overrides: dict) -> Agent:
+    """Build a new Agent with the given flag overrides applied."""
+    changes: dict = {}
+    for k, v in overrides.items():
+        if k == "model":
+            changes["model"] = v
+        elif k == "tools":
+            changes["tools"] = tuple(t.strip() for t in v.split(",") if t.strip())
+        elif k == "web":
+            if v in ("", "-", "none"):
+                changes["web"] = ()
+            else:
+                changes["web"] = tuple(t.strip() for t in v.split(",") if t.strip())
+        elif k == "max-turns":
+            changes["max_turns"] = int(v)
+        elif k == "max-depth":
+            changes["max_depth"] = int(v)
+        elif k == "max-children":
+            changes["max_children"] = int(v)
+        else:
+            raise ValueError(f"unknown flag: --{k}")
+    return replace(agent, **changes) if changes else agent
 
 
 def summarize_entry(e: dict) -> str:
     t = e["type"]
     p = e.get("payload", {}) or {}
     if t == "model_request":
-        return f"[dim]model_request tools={p.get('tools')}[/dim]"
+        bits = []
+        if p.get("tools"):
+            bits.append("tools=" + ",".join(p["tools"]))
+        if p.get("web_tools"):
+            bits.append("web=" + ",".join(s.split(":")[-1] for s in p["web_tools"]))
+        return "[dim]model_request[/dim] " + " ".join(bits)
     if t == "model_response":
         tcs = p.get("tool_calls") or []
         u = p.get("usage") or {}
-        suffix = ""
-        if isinstance(u, dict):
-            pt, ct = u.get("prompt_tokens"), u.get("completion_tokens")
-            usd, src = u.get("usd"), u.get("usd_source")
-            bits = []
-            if pt is not None or ct is not None:
-                bits.append(f"tok={pt or 0}/{ct or 0}")
-            if usd is not None:
-                bits.append(f"${usd:.5f}{'*' if src == 'estimate' else ''}")
-            cites = p.get("citations") or []
-            if cites:
-                bits.append(f"+{len(cites)}cites")
-            if bits:
-                suffix = " [dim](" + " ".join(bits) + ")[/dim]"
-        elif "usage_usd" in p:
-            suffix = f" [dim](${p['usage_usd']:.5f}*)[/dim]"
+        bits = []
+        if u.get("prompt_tokens") is not None or u.get("completion_tokens") is not None:
+            bits.append(f"tok={u.get('prompt_tokens') or 0}/{u.get('completion_tokens') or 0}")
+        if u.get("usd") is not None:
+            bits.append(f"${u['usd']:.5f}")
+        cites = p.get("citations") or []
+        if cites:
+            bits.append(f"+{len(cites)}cites")
+        suffix = " [dim](" + " ".join(bits) + ")[/dim]" if bits else ""
         if tcs:
             return "[dim]model_response[/dim] tool_calls=[{}]{}".format(
                 ", ".join(tc.get("name", "?") for tc in tcs), suffix
@@ -162,11 +182,10 @@ def summarize_entry(e: dict) -> str:
     if t == "tool_call":
         return f"[b]→[/b] {p.get('tool')} [dim]{json.dumps(p.get('args'))[:120]}[/dim]"
     if t == "tool_result":
-        ok = p.get("ok")
-        glyph = "[green]✓[/green]" if ok else "[red]✗[/red]"
+        glyph = "[green]✓[/green]" if p.get("ok") else "[red]✗[/red]"
         return f"  {glyph} {p.get('tool')} [dim]err={p.get('error')}[/dim]"
     if t == "spawn":
-        return f"[b magenta]spawn[/b magenta] → {p.get('child_id')}  budget=${p.get('budget_usd')}"
+        return f"[b magenta]spawn[/b magenta] → {p.get('child_id')} depth={p.get('depth')}"
     if t == "submit":
         return f"[b green]submit[/b green] [italic]{(p.get('result') or '')[:120]!r}[/italic]"
     if t == "halt":
@@ -174,6 +193,60 @@ def summarize_entry(e: dict) -> str:
     if t == "denial":
         return f"[yellow]denial[/yellow] reason={p.get('reason')} tool={p.get('tool')}"
     return t
+
+
+def build_tree(entries: list[dict]) -> str:
+    seats: dict[str, dict] = {}
+    parents: dict[str, str] = {}
+    for e in entries:
+        sid = e["seat_id"]
+        if sid and sid not in seats:
+            seats[sid] = {"id": sid, "turns": 0, "submit": None, "halt": None}
+            if e.get("parent_id"):
+                parents[sid] = e["parent_id"]
+        if e["type"] == "spawn":
+            child = (e.get("payload") or {}).get("child_id")
+            if child:
+                parents[child] = sid
+                seats.setdefault(
+                    child, {"id": child, "turns": 0, "submit": None, "halt": None}
+                )
+        if e["type"] == "model_response":
+            seats.setdefault(sid, {"id": sid, "turns": 0, "submit": None, "halt": None})
+            seats[sid]["turns"] += 1
+        if e["type"] == "submit":
+            seats.setdefault(sid, {"id": sid, "turns": 0, "submit": None, "halt": None})
+            seats[sid]["submit"] = (e.get("payload") or {}).get("result")
+        if e["type"] == "halt":
+            seats.setdefault(sid, {"id": sid, "turns": 0, "submit": None, "halt": None})
+            seats[sid]["halt"] = (e.get("payload") or {}).get("reason")
+
+    children: dict[str, list] = {}
+    roots: list = []
+    for sid in seats:
+        p = parents.get(sid)
+        if p is None:
+            roots.append(sid)
+        else:
+            children.setdefault(p, []).append(sid)
+
+    lines: list[str] = []
+
+    def render(sid: str, depth: int) -> None:
+        s = seats[sid]
+        indent = "  " * depth
+        line = f"{indent}[cyan]{s['id']}[/cyan]  turns={s['turns']}"
+        if s["submit"] is not None:
+            line += f"  submit=[italic]{s['submit']!r}[/italic]"
+        if s["halt"] is not None and s["submit"] is None:
+            line += f"  halt=[yellow]{s['halt']}[/yellow]"
+        lines.append(line)
+        for c in sorted(children.get(sid, [])):
+            render(c, depth + 1)
+
+    for r in sorted(roots):
+        render(r, 0)
+    return "\n".join(lines) or ""
 
 
 def read_log(path: Path) -> list[dict]:
@@ -195,6 +268,41 @@ def read_log(path: Path) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
+# Suggester (context-aware autocomplete)
+# --------------------------------------------------------------------------- #
+
+
+class HarnessSuggester(Suggester):
+    def __init__(self) -> None:
+        super().__init__(case_sensitive=False, use_cache=False)
+
+    async def get_suggestion(self, value: str) -> Optional[str]:
+        if not value or not value.startswith("/"):
+            return None
+        if " " not in value:
+            stem = value[1:].lower()
+            if not stem:
+                return None
+            for name in COMMANDS:
+                if name.startswith(stem):
+                    return "/" + name
+            return None
+        head, _, rest = value.partition(" ")
+        cmd = head[1:].lower()
+        if " " in rest:
+            return None
+        if cmd in ("run", "chat"):
+            for n in list_agents():
+                if n.startswith(rest):
+                    return f"{head} {n}"
+        if cmd in ("view", "tree"):
+            for r in list_runs():
+                if r.name.startswith(rest):
+                    return f"{head} {r.name}"
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # App
 # --------------------------------------------------------------------------- #
 
@@ -203,30 +311,6 @@ CSS = """
 Screen { layout: vertical; }
 #output { height: 1fr; padding: 0 1; }
 #prompt { dock: bottom; }
-"""
-
-
-HELP_TEXT = """\
-[b]how to use[/b]
-
-  Just type a message and hit enter — a chat with the agent starts
-  automatically. The agent can run Python via the [b]code_exec[/b] tool.
-  Type [cyan]/end[/cyan] to end the chat.
-
-[b]commands[/b]
-
-  [cyan]/login[/cyan] [dim]<key>[/dim]         sign in (saves your OpenRouter API key, 0600)
-  [cyan]/logout[/cyan]              clear the saved key
-  [cyan]/status[/cyan]              auth, default model, chat state
-  [cyan]/model[/cyan] [dim]<id|->[/dim]       set or clear the session model override
-  [cyan]/policies[/cyan]            list available policies
-  [cyan]/runs[/cyan]                list past runs
-  [cyan]/view[/cyan] [dim]<run>[/dim]          replay a run's timeline
-  [cyan]/tree[/cyan] [dim]<run>[/dim]          show a run's seat tree
-  [cyan]/chat[/cyan] [dim][policy] [--model M][/dim]    start a chat (default policy: chat)
-  [cyan]/end[/cyan]                 end the current chat
-  [cyan]/run[/cyan]  [dim]<policy> [--model M] <message...>[/dim]   one-shot task
-  [cyan]/clear[/cyan] · [cyan]/help[/cyan] · [cyan]/quit[/cyan]
 """
 
 
@@ -245,8 +329,8 @@ class HarnessApp(App):
         self._active_run: Optional[Path] = None
         self._active_seen_seq: int = 0
         self._is_running: bool = False
-        self._chat = None  # active ChatSession or None
-        self._chat_policy_name: Optional[str] = None
+        self._chat = None
+        self._chat_agent_name: Optional[str] = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -305,11 +389,9 @@ class HarnessApp(App):
 
     def _dispatch(self, raw: str) -> None:
         if not raw.startswith("/"):
-            # In an active chat, free text is the next user message.
             if self._chat is not None:
                 self._send_chat(raw)
                 return
-            # Auto-start a chat on the first plain-text message.
             if not credentials.get_api_key():
                 self._line("[red]not signed in.[/red]  use [cyan]/login <key>[/cyan] first.")
                 return
@@ -320,7 +402,6 @@ class HarnessApp(App):
         head, _, rest = raw.partition(" ")
         cmd = head[1:].lower()
         rest = rest.strip()
-
         handler = getattr(self, f"_cmd_{cmd}", None)
         if handler is None:
             self._line(f"[red]unknown command:[/red] {head}")
@@ -348,16 +429,18 @@ class HarnessApp(App):
             self._line(f"auth: [green]signed in[/green]   key=[dim]{credentials.mask(key)}[/dim]")
         else:
             self._line("auth: [yellow]not signed in[/yellow]")
-        self._line(f"default model: [b]{self._effective_model()}[/b]"
-                   + ("  [dim](session override)[/dim]" if self._session_model else ""))
+        self._line(
+            f"default model: [b]{self._effective_model()}[/b]"
+            + ("  [dim](session override)[/dim]" if self._session_model else "")
+        )
         if self._chat is not None:
             seat = self._chat.seat
             self._line(
-                f"chat: [green]active[/green]   policy=[b]{self._chat_policy_name}[/b]   "
+                f"chat: [green]active[/green]   agent=[b]{self._chat_agent_name}[/b]   "
                 f"turns=[b]{seat.turns_used}[/b]   "
-                f"tokens=[b]{seat.tokens_prompt}[/b]/[b]{seat.tokens_completion}[/b] "
-                f"[dim](prompt/completion)[/dim]   "
-                f"budget=$[b]{seat.budget.usd_remaining:.4f}[/b]"
+                f"tokens=[b]{seat.tokens_prompt}[/b]/[b]{seat.tokens_completion}[/b]   "
+                f"spent=$[b]{seat.cost_usd:.4f}[/b]   "
+                f"searches=[b]{seat.web_searches}[/b]"
             )
         else:
             self._line("chat: [dim]inactive[/dim]")
@@ -368,8 +451,6 @@ class HarnessApp(App):
         key = rest.strip()
         if not key:
             self._line("usage: [cyan]/login <openrouter-api-key>[/cyan]")
-            self._line("[dim]paste your key right after /login. it's stored 0600 at "
-                       f"{credentials.CREDENTIALS_PATH}.[/dim]")
             return
         if len(key) < 20:
             self._line("[red]that doesn't look like a real key (too short)[/red]")
@@ -392,10 +473,8 @@ class HarnessApp(App):
     def _cmd_model(self, rest: str) -> None:
         rest = rest.strip()
         if not rest:
-            self._line(f"current: [b]{self._effective_model()}[/b]"
-                       + ("  [dim](session override)[/dim]" if self._session_model else "  [dim](policy default)[/dim]"))
-            self._line("usage: [cyan]/model moonshotai/kimi-k2.6[/cyan]   (or any OpenRouter model id)")
-            self._line("       [cyan]/model -[/cyan]   to clear the override")
+            self._line(f"current: [b]{self._effective_model()}[/b]")
+            self._line("usage: [cyan]/model moonshotai/kimi-k2.6[/cyan]   (or [cyan]/model -[/cyan] to clear)")
             return
         if rest == "-":
             self._session_model = None
@@ -404,11 +483,17 @@ class HarnessApp(App):
         self._session_model = rest
         self._line(f"session model set to [b]{rest}[/b]")
 
-    def _cmd_policies(self, _rest: str) -> None:
-        for name in list_policies():
+    def _cmd_agents(self, _rest: str) -> None:
+        for name in list_agents():
             try:
-                p = load_policy(name)
-                self._line(f"  [cyan]{name}[/cyan]  [dim]tools={list(p.tools)}  model={p.model}  budget=${p.budget_usd}[/dim]")
+                a = load_agent(name)
+                bits = f"tools={list(a.tools)}"
+                if a.web:
+                    bits += f"  web={list(a.web)}"
+                bits += f"  model={a.model}  max_turns={a.max_turns}"
+                if a.max_depth > 0:
+                    bits += f"  max_depth={a.max_depth}"
+                self._line(f"  [cyan]{name}[/cyan]  [dim]{bits}[/dim]")
             except Exception as e:
                 self._line(f"  [cyan]{name}[/cyan]  [red]load error: {e}[/red]")
 
@@ -440,130 +525,66 @@ class HarnessApp(App):
         entries = read_log(run / "log.jsonl")
         self._line(build_tree(entries) or "(no seats)")
 
-    def _cmd_run(self, rest: str) -> None:
-        if self._is_running:
-            self._line("[yellow]a run is already in progress; wait for it to finish[/yellow]")
-            return
-        if not rest:
-            self._line("usage: [cyan]/run <policy> [--model M] <message...>[/cyan]")
-            self._line(f"policies: {', '.join(list_policies())}")
-            return
-        try:
-            tokens = shlex.split(rest)
-        except ValueError as e:
-            self._line(f"[red]bad quoting:[/red] {e}")
-            return
-        if not tokens:
-            self._line("usage: [cyan]/run <policy> [--model M] <message...>[/cyan]")
-            return
-        policy_name = tokens[0]
-        if policy_name not in list_policies():
-            self._line(f"[red]unknown policy:[/red] {policy_name}  (known: {', '.join(list_policies())})")
-            return
-
-        # Parse --model override.
-        i = 1
-        model_override: Optional[str] = None
-        while i < len(tokens) and tokens[i].startswith("--"):
-            flag = tokens[i]
-            if flag == "--model":
-                if i + 1 >= len(tokens):
-                    self._line("[red]--model needs a value[/red]")
-                    return
-                model_override = tokens[i + 1]
-                i += 2
-            else:
-                self._line(f"[red]unknown flag:[/red] {flag}")
-                return
-        message = " ".join(tokens[i:]).strip()
-        if not message:
-            self._line("[red]missing user message[/red]")
-            return
-
-        if not credentials.get_api_key():
-            self._line("[red]a run needs an API key.[/red]  use [cyan]/login <key>[/cyan] first.")
-            return
-        credentials.inject_env()
-
-        policy = load_policy(policy_name)
-        effective_model = model_override or self._session_model
-        policy = with_model_override(policy, effective_model)
-
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        run_dir = RUNS_DIR / f"{policy_name}-{ts}"
-        if run_dir.exists():
-            shutil.rmtree(run_dir)
-        run_dir.mkdir(parents=True, exist_ok=True)
-
-        self._line(f"[b]→ running[/b] [cyan]{policy_name}[/cyan]  model=[b]{policy.model}[/b]  budget=$[b]{policy.budget_usd}[/b]")
-        self._line(f"[dim]   {run_dir}[/dim]")
-        self._active_run = run_dir / "log.jsonl"
-        self._active_seen_seq = 0
-        self._is_running = True
-        self.run_worker(
-            self._do_run(policy_name, policy, run_dir, message),
-            exclusive=True,
-            group="run",
-            thread=True,
-        )
-
-    # ---- chat ----------------------------------------------------------- #
+    # ---- /chat ---------------------------------------------------------- #
 
     def _cmd_chat(self, rest: str) -> None:
         if self._chat is not None:
-            self._line(f"[yellow]chat already active[/yellow] (policy: {self._chat_policy_name}). "
-                       "use [cyan]/end[/cyan] to end it first.")
+            self._line(
+                f"[yellow]chat already active[/yellow] (agent: {self._chat_agent_name}). "
+                "use [cyan]/end[/cyan] to end it first."
+            )
             return
         try:
             tokens = shlex.split(rest) if rest else []
         except ValueError as e:
             self._line(f"[red]bad quoting:[/red] {e}")
             return
-        policy_name = "chat"
-        model_override: Optional[str] = None
-        i = 0
+
+        agent_name = DEFAULT_CHAT_AGENT
         if tokens and not tokens[0].startswith("--"):
-            policy_name = tokens[0]
-            i = 1
-        while i < len(tokens):
-            if tokens[i] == "--model":
-                if i + 1 >= len(tokens):
-                    self._line("[red]--model needs a value[/red]")
-                    return
-                model_override = tokens[i + 1]
-                i += 2
-            else:
-                self._line(f"[red]unknown flag:[/red] {tokens[i]}")
-                return
-        if policy_name not in list_policies():
-            self._line(f"[red]unknown policy:[/red] {policy_name}  (known: {', '.join(list_policies())})")
+            agent_name = tokens[0]
+            tokens = tokens[1:]
+        try:
+            overrides, leftover = parse_overrides(tokens)
+        except ValueError as e:
+            self._line(f"[red]{e}[/red]")
+            return
+        if leftover:
+            self._line(f"[red]unexpected arg(s):[/red] {leftover}")
+            return
+
+        if agent_name not in list_agents():
+            self._line(f"[red]unknown agent:[/red] {agent_name}  (known: {', '.join(list_agents())})")
             return
         if not credentials.get_api_key():
             self._line("[red]chat needs an API key.[/red]  use [cyan]/login <key>[/cyan] first.")
             return
         credentials.inject_env()
 
-        policy = load_policy(policy_name)
-        effective_model = model_override or self._session_model
-        policy = with_model_override(policy, effective_model)
+        try:
+            agent = load_agent(agent_name)
+            agent = apply_overrides(agent, overrides)
+            if self._session_model and "model" not in overrides:
+                agent = replace(agent, model=self._session_model)
+        except Exception as e:
+            self._line(f"[red]bad agent config:[/red] {e}")
+            return
 
         ts = time.strftime("%Y%m%d-%H%M%S")
-        run_dir = RUNS_DIR / f"chat-{policy_name}-{ts}"
+        run_dir = RUNS_DIR / f"chat-{agent_name}-{ts}"
         if run_dir.exists():
             shutil.rmtree(run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        self._chat = start_chat(
-            policy=policy,
-            log_path=run_dir / "log.jsonl",
-            workdir=run_dir / "wd",
-            kill_path=run_dir / "kill",
-        )
-        self._chat_policy_name = policy_name
-        self._active_run = run_dir / "log.jsonl"  # so /tree etc see it
+        self._chat = start_chat(agent=agent, log_path=run_dir / "log.jsonl", workdir=run_dir / "wd")
+        self._chat_agent_name = agent_name
+        self._active_run = run_dir / "log.jsonl"
         self._active_seen_seq = 0
-        self._line(f"[b green]chat started[/b green]   policy=[cyan]{policy_name}[/cyan]  "
-                   f"model=[b]{policy.model}[/b]  budget=$[b]{policy.budget_usd}[/b]")
+        self._line(
+            f"[b green]chat started[/b green]   agent=[cyan]{agent_name}[/cyan]  "
+            f"model=[b]{agent.model}[/b]  tools={list(agent.tools)}  "
+            + (f"web={list(agent.web)}" if agent.web else "")
+        )
         self._line(f"[dim]   {run_dir}[/dim]")
         self._line("[dim]type a message (no /), or [/dim][cyan]/end[/cyan][dim] to stop.[/dim]")
 
@@ -575,26 +596,22 @@ class HarnessApp(App):
             self._chat.close()
         except Exception:
             pass
-        used_budget = (self._chat.seat.budget.usd_remaining)
-        self._line(f"[b yellow]chat ended[/b yellow]   "
-                   f"turns={self._chat.seat.turns_used}  "
-                   f"budget_remaining=${used_budget:.4f}")
+        seat = self._chat.seat
+        self._line(
+            f"[b yellow]chat ended[/b yellow]   turns={seat.turns_used}  "
+            f"spent=$[b]{seat.cost_usd:.4f}[/b]"
+        )
         self._chat = None
-        self._chat_policy_name = None
+        self._chat_agent_name = None
         self._active_run = None
 
     def _send_chat(self, user_text: str) -> None:
         if self._is_running:
-            self._line("[yellow]a run is in progress; wait for it to finish[/yellow]")
+            self._line("[yellow]busy[/yellow] — wait for the current turn to finish")
             return
         self._line(f"[b cyan]you[/b cyan]  {user_text}")
         self._is_running = True
-        self.run_worker(
-            self._do_chat_turn(user_text),
-            exclusive=True,
-            group="chat",
-            thread=True,
-        )
+        self.run_worker(self._do_chat_turn(user_text), exclusive=True, group="chat", thread=True)
 
     async def _do_chat_turn(self, user_text: str) -> None:
         try:
@@ -610,31 +627,87 @@ class HarnessApp(App):
             )
 
     def _on_chat_reply(self, reply: str) -> None:
-        # Stream any tool-call entries that fired during this turn, then the reply.
         self._tail_active_run()
         if reply:
             self._line(f"[b green]agent[/b green]  {reply}")
         self._is_running = False
 
-    # ---- run worker ----------------------------------------------------- #
+    # ---- /run ----------------------------------------------------------- #
 
-    async def _do_run(self, policy_name: str, policy, run_dir: Path, message: str) -> None:
+    def _cmd_run(self, rest: str) -> None:
+        if self._is_running:
+            self._line("[yellow]busy[/yellow] — wait for the current task to finish")
+            return
+        if not rest:
+            self._line("usage: [cyan]/run <agent> [--flags...] <message>[/cyan]")
+            self._line(f"agents: {', '.join(list_agents())}")
+            return
+        try:
+            tokens = shlex.split(rest)
+        except ValueError as e:
+            self._line(f"[red]bad quoting:[/red] {e}")
+            return
+        if not tokens:
+            return
+
+        agent_name = tokens[0]
+        if agent_name not in list_agents():
+            self._line(f"[red]unknown agent:[/red] {agent_name}  (known: {', '.join(list_agents())})")
+            return
+        try:
+            overrides, remaining = parse_overrides(tokens[1:])
+        except ValueError as e:
+            self._line(f"[red]{e}[/red]")
+            return
+        message = " ".join(remaining).strip()
+        if not message:
+            self._line("[red]missing user message[/red]")
+            return
+        if not credentials.get_api_key():
+            self._line("[red]a run needs an API key.[/red]  use [cyan]/login <key>[/cyan] first.")
+            return
+        credentials.inject_env()
+
+        try:
+            agent = load_agent(agent_name)
+            agent = apply_overrides(agent, overrides)
+            if self._session_model and "model" not in overrides:
+                agent = replace(agent, model=self._session_model)
+        except Exception as e:
+            self._line(f"[red]bad agent config:[/red] {e}")
+            return
+
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        run_dir = RUNS_DIR / f"{agent_name}-{ts}"
+        if run_dir.exists():
+            shutil.rmtree(run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        self._line(
+            f"[b]→ running[/b] [cyan]{agent_name}[/cyan]  model=[b]{agent.model}[/b]  "
+            f"tools={list(agent.tools)}"
+            + (f"  web={list(agent.web)}" if agent.web else "")
+        )
+        self._line(f"[dim]   {run_dir}[/dim]")
+        self._active_run = run_dir / "log.jsonl"
+        self._active_seen_seq = 0
+        self._is_running = True
+        self.run_worker(self._do_run(agent, run_dir, message), exclusive=True, group="run", thread=True)
+
+    async def _do_run(self, agent: Agent, run_dir: Path, message: str) -> None:
         try:
             res = run_forest(
-                policy=policy,
+                agent=agent,
                 log_path=run_dir / "log.jsonl",
                 workdir=run_dir / "wd",
-                kill_path=run_dir / "kill",
                 user_message=message,
             )
             seat = res.root_seat
             summary = (
-                f"[b green]done[/b green]   "
-                f"submit={seat.submit_result!r}   "
-                f"halt={seat.halt_reason}   "
-                f"turns={seat.turns_used}   "
+                f"[b green]done[/b green]   submit={seat.submit_result!r}   "
+                f"halt={seat.halt_reason}   turns={seat.turns_used}   "
                 f"tokens={seat.tokens_prompt}/{seat.tokens_completion}   "
-                f"budget_remaining=${seat.budget.usd_remaining:.4f}"
+                f"spent=$[b]{seat.cost_usd:.4f}[/b]"
             )
             self.call_from_thread(self._on_run_done, summary)
         except Exception:
@@ -643,12 +716,10 @@ class HarnessApp(App):
             )
 
     def _on_run_done(self, summary: str) -> None:
-        # Drain any final log entries first.
         self._tail_active_run()
         self._line(summary)
         self._line("")
         self._is_running = False
-        self._active_run = None
 
     # ---- live tail ------------------------------------------------------ #
 
@@ -683,66 +754,6 @@ class HarnessApp(App):
 
     def action_clear(self) -> None:
         self._cmd_clear("")
-
-
-# --------------------------------------------------------------------------- #
-# Tree builder (shared logic with view.py)
-# --------------------------------------------------------------------------- #
-
-
-def build_tree(entries: list[dict]) -> str:
-    seats: dict[str, dict] = {}
-    parents: dict[str, str] = {}
-    for e in entries:
-        sid = e["seat_id"]
-        if sid and sid not in seats:
-            seats[sid] = {"id": sid, "turns": 0, "submit": None, "halt": None}
-            if e.get("parent_id"):
-                parents[sid] = e["parent_id"]
-        if e["type"] == "spawn":
-            child = (e.get("payload") or {}).get("child_id")
-            if child:
-                parents[child] = sid
-                seats.setdefault(child, {"id": child, "turns": 0, "submit": None, "halt": None})
-        if e["type"] == "model_response":
-            seats.setdefault(sid, {"id": sid, "turns": 0, "submit": None, "halt": None})
-            seats[sid]["turns"] += 1
-        if e["type"] == "submit":
-            seats.setdefault(sid, {"id": sid, "turns": 0, "submit": None, "halt": None})
-            seats[sid]["submit"] = (e.get("payload") or {}).get("result")
-        if e["type"] == "halt":
-            seats.setdefault(sid, {"id": sid, "turns": 0, "submit": None, "halt": None})
-            seats[sid]["halt"] = (e.get("payload") or {}).get("reason")
-
-    children: dict[str, list] = {}
-    roots: list = []
-    for sid in seats:
-        p = parents.get(sid)
-        if p is None:
-            roots.append(sid)
-        else:
-            children.setdefault(p, []).append(sid)
-
-    lines: list[str] = []
-
-    def render(sid: str, depth: int) -> None:
-        s = seats[sid]
-        indent = "  " * depth
-        line = f"{indent}[cyan]{s['id']}[/cyan]  turns={s['turns']}"
-        if s["submit"] is not None:
-            line += f"  submit=[italic]{s['submit']!r}[/italic]"
-        if s["halt"] is not None and s["submit"] is None:
-            line += f"  halt=[yellow]{s['halt']}[/yellow]"
-        lines.append(line)
-        for c in sorted(children.get(sid, [])):
-            render(c, depth + 1)
-
-    for r in sorted(roots):
-        render(r, 0)
-    return "\n".join(lines) or ""
-
-
-# --------------------------------------------------------------------------- #
 
 
 def main() -> int:

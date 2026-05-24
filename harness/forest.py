@@ -2,12 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from .driver import run_seat
 from .log import Log
-from .tools import RunCtx
-from .types import Budget, Policy, Seat, ToolResult
+from .tools import RunCtx, mint_seat
+from .types import Agent, Seat, ToolResult
 
 
 @dataclass
@@ -18,39 +17,25 @@ class ForestResult:
 
 
 def run_forest(
-    policy: Policy,
+    agent: Agent,
     log_path: Path,
     workdir: Path,
-    kill_path: Path,
     user_message: str,
 ) -> ForestResult:
-    """Top-level entrypoint. Mints the root seat from the policy and runs it."""
+    """Top-level entrypoint: mint the root seat from `agent` and run it."""
     log_path = Path(log_path)
     workdir = Path(workdir)
-    kill_path = Path(kill_path)
     workdir.mkdir(parents=True, exist_ok=True)
 
     log = Log(log_path)
-    ctx = RunCtx(
-        log=log,
-        workdir=workdir,
-        kill_path=kill_path,
-        policy=policy,
-    )
+    ctx = RunCtx(log=log, workdir=workdir, agent=agent)
 
-    root = Seat(
-        id="s0",
+    root = mint_seat(
+        agent=agent,
+        seat_id="s0",
         parent_id=None,
         depth=0,
-        prompt=policy.system_prompt,
-        granted_tools=policy.tools,
-        model=policy.model,
-        limits=policy.limits,
-        budget=Budget(usd_remaining=policy.budget_usd),
         history=[{"role": "user", "content": user_message}],
-        web=policy.web,
-        web_max_results=policy.web_max_results,
-        web_search_context_size=policy.web_search_context_size,
     )
 
     try:

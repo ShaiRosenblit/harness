@@ -9,5 +9,5 @@ dependencies = [
 ]
 
 [tool.pyright]
-include = ["harness", "policies", "ui.py"]
+include = ["harness", "agents", "ui.py"]
 typeCheckingMode = "basic"

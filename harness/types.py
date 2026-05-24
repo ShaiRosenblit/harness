@@ -1,28 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Tuple
-
-
-STARTER_PROMPT = (
-    "You complete the given task using the available tools. "
-    "You act by calling tools; you'll see each result and can continue. "
-    "Call submit() with your answer when done."
-)
-
-
-@dataclass(frozen=True)
-class Limits:
-    max_turns: int
-    max_depth: int
-    max_children: int
-    max_concurrent_seats: int
-    tool_timeout_s: float
-
-
-@dataclass
-class Budget:
-    usd_remaining: float
+from typing import Callable, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -45,20 +24,31 @@ class ToolSpec:
     name: str
     description: str
     parameters: dict
-    requires_approval: bool
     handler: Callable[..., ToolResult]
 
 
 @dataclass
 class Seat:
+    """One running agent in the forest. Children spawned from this seat
+    inherit the same config fields (model, system_prompt, tools, web,
+    max_turns, max_depth, max_children, tool_timeout_s, web_*) at depth+1.
+    Recursion is bounded by max_depth.
+
+    Token/cost counters are observability only — not enforced.
+    """
     id: str
     parent_id: Optional[str]
     depth: int
-    prompt: str
-    granted_tools: Tuple[str, ...]
     model: str
-    limits: Limits
-    budget: Budget
+    system_prompt: str
+    tools: Tuple[str, ...]
+    web: Tuple[str, ...]
+    max_turns: int
+    max_depth: int
+    max_children: int
+    tool_timeout_s: float
+    web_max_results: int
+    web_search_context_size: str
     history: list = field(default_factory=list)
     turns_used: int = 0
     child_count: int = 0
@@ -67,12 +57,8 @@ class Seat:
     submit_result: Optional[str] = None
     tokens_prompt: int = 0
     tokens_completion: int = 0
-    # Web (server-side) tool grants. Subset of ("search", "fetch").
-    # Resolved server-side by OpenRouter; the local adjudicator does not run them.
-    web: Tuple[str, ...] = ()
-    web_max_results: int = 4
-    web_search_context_size: str = "low"  # "low" | "medium" | "high"
-    web_searches: int = 0  # cumulative across this seat's turns
+    cost_usd: float = 0.0
+    web_searches: int = 0
 
 
 @dataclass(frozen=True)
@@ -86,16 +72,22 @@ class LogEntry:
 
 
 @dataclass(frozen=True)
-class Policy:
-    name: str
+class Agent:
+    """An agent config — what model, what prompt, what capabilities, what
+    structural limits. The harness mints a seat from this for a run.
+
+    When a seat spawns, the child inherits this exact config (same model,
+    same prompt, same tools, same web grants) at depth+1. There is no
+    separate child template — children are copies of the parent. Recursion
+    is bounded by max_depth.
+    """
     model: str
     system_prompt: str
-    tools: Tuple[str, ...]
-    limits: Limits
-    budget_usd: float
-    child_policy: Optional["Policy"] = None
-    # Server-side web tool grants (resolved by OpenRouter, not by us).
-    # Subset of ("search", "fetch"). Empty tuple = no web access.
-    web: Tuple[str, ...] = ()
+    tools: Tuple[str, ...]   # subset of: code_exec, submit, spawn
+    max_turns: int = 12
+    max_depth: int = 1
+    max_children: int = 3
+    tool_timeout_s: float = 15.0
+    web: Tuple[str, ...] = ()   # subset of: search, fetch  (resolved by OpenRouter)
     web_max_results: int = 4
-    web_search_context_size: str = "low"  # "low" | "medium" | "high"
+    web_search_context_size: str = "low"   # "low" | "medium" | "high"

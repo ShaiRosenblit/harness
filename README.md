@@ -1,12 +1,16 @@
 # harness
 
-A small, fully-owned harness for running LLM agents — chat with one, or hand
-it a task. Built on the official `openai` SDK pointed at
-[OpenRouter](https://openrouter.ai), with no agent framework underneath.
+A small, fully-owned harness for running LLM agents — talk to one, or hand
+it a task. Single-pane interactive shell over the official `openai` SDK
+pointed at [OpenRouter](https://openrouter.ai). No agent framework
+underneath.
 
-Single file UI (`ui.py`). One forest-wide JSONL log per run. Capability
-grants, budget caps, and a file-based kill switch are all enforced by the
-substrate; what the agent does is controlled by the policy.
+```
+harness/      substrate + driver  (the whole engine, ~7 files)
+agents/       3 agent configs:  chat, task, research
+ui.py         interactive shell
+pyproject.toml
+```
 
 ## Install
 
@@ -14,122 +18,97 @@ substrate; what the agent does is controlled by the policy.
 pip install -e .
 ```
 
-Get an OpenRouter API key from <https://openrouter.ai/keys>.
+Get an OpenRouter API key at <https://openrouter.ai/keys>.
 
 ## Run
 
 ```
 python3 ui.py
-```
-
-Then, inside the UI:
-
-```
-/login sk-or-v1-...     # one-time; saves the key to ~/.config/harness/credentials.json (0600)
-what is 7 ** 11?        # plain text -> auto-starts a chat
-/end                    # end the chat
-/run task find the 1000th prime, then submit it as a string
-/help                   # all commands
+/login sk-or-v1-...        # one-time; saves to ~/.config/harness/credentials.json (0600)
+what is 7 ** 11?           # plain text -> auto-starts a chat
+/end                       # end the chat
+/run task <message>        # one-shot task that must call submit()
+/run research <message>    # one-shot research with web access
+/help                      # all commands
 ```
 
 ## Commands
 
 | | |
 |---|---|
-| `/login <key>` | save your OpenRouter API key |
-| `/logout` | clear the saved key |
+| `/login <key>` · `/logout` | manage the saved OpenRouter API key |
 | `/status` | auth, default model, chat state |
-| `/model <id>` | session-wide model override (e.g. `anthropic/claude-haiku-4-5`); `/model -` clears it |
-| `/policies` | list available policies |
+| `/model <id>` | session-wide model override (`/model -` clears) |
+| `/agents` | list available agent configs |
 | `/runs` | list past runs |
-| `/view <run>` | replay a run's timeline |
+| `/view <run>` | replay a run's full timeline |
 | `/tree <run>` | seat tree for a run |
-| `/chat [policy] [--model M]` | start a chat session (default policy: `chat`) |
+| `/chat [agent] [flags]` | start a chat (defaults to `chat` agent) |
 | `/end` | end the active chat |
-| `/run <policy> [--model M] <message...>` | one-shot task (the agent must call `submit` to finish) |
+| `/run <agent> [flags] <message>` | one-shot task |
 | `/clear` `/help` `/quit` | |
 
-Plain text without a leading `/` is interpreted as a chat message. If no
-chat is active, one auto-starts with the default policy.
+Plain text without a leading `/` is sent as a chat message. If no chat
+is active, one auto-starts.
 
-## Policies
+## Flags for `/run` and `/chat`
 
-A policy in `policies/<name>.py` controls what an agent can do:
+Override any field of the agent config at launch time:
 
-- system prompt
-- granted tools (subset of `code_exec`, `submit`, `spawn`)
-- model id (any OpenRouter model)
-- budget cap (USD) and limits (turns, depth, breadth, concurrent seats)
-- for spawn: a `child_policy` template (children's tools/budget are
-  attenuated from the parent)
+```
+--model <id>             OpenRouter model id (e.g. anthropic/claude-haiku-4-5)
+--tools a,b,c            local tools (code_exec, submit, spawn)
+--web search,fetch       enable OpenRouter web tools (or --web none)
+--max-turns N            per-seat turn cap
+--max-depth N            spawn-recursion depth
+--max-children N         siblings per seat
+```
 
-Policies that ship:
+Example:
 
-- **`chat`** — conversational mode. `code_exec` only (no `submit`); the
-  agent answers in text, you keep the conversation going.
-- **`task`** — one-shot mode. `code_exec` + `submit` + `spawn`. The agent
-  must call `submit(...)` to finish. Sub-agents inherit `code_exec` +
-  `submit` only.
-- **`task_deep`** — same as `task` but the child template ALSO grants
-  `spawn`, allowing a depth-2 tree (root → child → grandchild).
-- **`research`** — single-seat agent with OpenRouter's server-side
-  `web_search` and `web_fetch` enabled. The agent searches the live web
-  and citations come back attached to its reply.
+```
+/run task --max-depth=3 --max-children=4 split 30 numbers into 4 ranges, spawn a sub-agent per range
+/chat --web search       chat with web search but no fetch
+/run research --model anthropic/claude-haiku-4-5 latest Kubernetes LTS version
+```
 
-To add your own, copy one of these and edit. The UI picks them up
-automatically.
+## Agents
 
-### Web access
+An agent is a single flat dataclass — a kind of agent, with one model,
+one prompt, one set of tools, one set of limits. When a seat spawns, the
+child gets a copy of the same config (one less depth slot). Capability
+attenuation is automatic — child == parent.
 
-Set `web=("search",)` and/or `("search", "fetch")` on a `Policy` to grant
-[OpenRouter's server-side web tools](https://openrouter.ai/docs). These
-are NOT executed by the harness — OpenRouter handles them inside the
-chat-completion call, loops internally if the model searches multiple
-times, and returns the final answer with `url_citation` annotations
-which the harness parses into `model_response.payload.citations`.
-`web_max_results` (default 4) and `web_search_context_size` ("low" /
-"medium" / "high", default "low") are configurable per policy. Web cost
-is included in OpenRouter's returned `usage.cost` and debited from the
-seat's budget like any other model call.
+Three agents ship:
 
-Web access attenuates through `spawn` the same way local tools do: a
-child can only get web modes its parent already has.
+- **`chat`** — talks to the user turn by turn. `code_exec` + web. No
+  `submit` (yields on text-only replies). No `spawn`.
+- **`task`** — one-shot. `code_exec` + `submit` + `spawn`. Must call
+  `submit()` to finish. Children inherit the same config, so the agent
+  can decompose recursively up to `max_depth` deep.
+- **`research`** — single seat with web access. `code_exec` + `submit`
+  + `web=(search, fetch)`. No `spawn`.
 
-## Logs and runs
+Add your own at `agents/<name>.py` — just one `AGENT = Agent(...)` per
+file. The UI picks them up automatically.
 
-Each run writes a forest-wide JSONL log to
-`runs/<policy>-<timestamp>/log.jsonl`. Inspect inside the UI with
-`/view` and `/tree`, or read the JSONL directly.
+## Logs
+
+Each run writes one forest-wide JSONL at `runs/<agent>-<timestamp>/log.jsonl`.
+Inspect inside the UI with `/view` and `/tree`, or read directly.
 
 Every line: `{seq, ts, seat_id, parent_id, type, payload}`. Types:
 `model_request`, `model_response`, `tool_call`, `tool_result`, `spawn`,
 `submit`, `halt`, `denial`.
 
-## Kill switch
+## What stops a runaway
 
-Drop a file at `runs/<name>/kill`:
+- **`max_turns`** per seat — hard cap on model calls per agent.
+- **`max_depth`** — hard cap on spawn recursion.
+- **`max_children`** — hard cap on siblings per seat.
+- **Ctrl+C** — kills the process.
 
-- file missing → alive
-- file present, empty → whole forest halts on its next pre-turn check
-- file present, non-empty → each line is a dotted seat-id prefix; matching
-  seats and their subtrees halt
-
-## Layout
-
-```
-harness/        substrate + driver
-  types.py        Seat, Policy, Limits, Budget, LogEntry, ToolSpec, ToolResult
-  log.py          single-file JSONL writer
-  killswitch.py   file-based kill check
-  credentials.py  ~/.config/harness/credentials.json
-  model.py        the one OpenRouter call wrapper
-  tools.py        adjudicator + built-in tools (code_exec, submit, spawn)
-  driver.py       the per-seat turn loop
-  forest.py       /run entrypoint
-  session.py     /chat entrypoint (persistent seat, yields on text-only)
-policies/
-  chat.py
-  task.py
-ui.py
-pyproject.toml
-```
+Token/cost counters are tracked per seat for observability (`/status`
+shows them, run summaries include them) but not enforced. If you want
+a hard dollar ceiling, set `max_turns` tightly enough — at typical model
+rates, that's the same thing.
