@@ -44,7 +44,7 @@ DEFAULT_CHAT_AGENT = "chat"
 
 COMMANDS = (
     "help", "login", "logout", "status", "model",
-    "agents", "runs", "view", "tree",
+    "agents", "skills", "runs", "view", "tree",
     "chat", "end", "run",
     "approve", "deny", "approvals",
     "clear", "quit", "exit",
@@ -506,6 +506,17 @@ class HarnessApp(App):
             return
         self._session_model = rest
         self._line(f"session model set to [b]{rest}[/b]")
+
+    def _cmd_skills(self, _rest: str) -> None:
+        from harness.skills import list_skills
+        skills = list_skills()
+        if not skills:
+            self._line("[dim](no skills installed — add markdown files to skills/)[/dim]")
+            return
+        for s in skills:
+            self._line(f"  [cyan]{s.name}[/cyan]  [dim]{s.description}[/dim]")
+            if s.when_to_use:
+                self._line(f"     [dim]when: {s.when_to_use}[/dim]")
 
     def _cmd_agents(self, _rest: str) -> None:
         for name in list_agents():

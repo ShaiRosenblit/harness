@@ -10,12 +10,13 @@ from .log import Log
 from .types import Seat, ToolSpec
 
 
-def _harness_preamble() -> str:
-    """Real-time context the model can rely on each turn: date, ISO timestamp,
-    timezone. Prepended to the system prompt on every model_request so the
-    agent never has to guess what 'today' is or how to date a search."""
+def _harness_preamble(seat: Seat) -> str:
+    """Real-time context the model can rely on each turn:
+       - today's date / timestamp / timezone
+       - the catalog of skills available (when use_skill is granted)
+    Prepended to the seat's system prompt on every model_request."""
     now = _dt.datetime.now().astimezone()
-    return (
+    out = (
         f"[harness context]\n"
         f"  today: {now.date().isoformat()}\n"
         f"  now:   {now.isoformat(timespec='seconds')}\n"
@@ -25,6 +26,20 @@ def _harness_preamble() -> str:
         f"today's, this week's, this year's, etc.), include today's "
         f"year explicitly in the query so fresh results surface.\n"
     )
+    if "use_skill" in seat.tools:
+        from .skills import list_skills
+        skills = list_skills()
+        if skills:
+            lines = "\n".join(
+                f"  {s.name} — {s.description}" for s in skills
+            )
+            out += (
+                f"\n[available skills]\n{lines}\n"
+                "Call use_skill(name) to load a skill's full procedure as a "
+                "tool result. When a user request matches a skill's "
+                "description, load it before acting.\n"
+            )
+    return out
 
 
 # ---- Normalized response shape ---------------------------------------------
@@ -161,7 +176,7 @@ def call_model(seat: Seat, tool_specs: List[ToolSpec], log: Log) -> ModelRespons
     calls OpenRouter, logs request and response, and accumulates the seat's
     observability counters (cost_usd, tokens_*, web_searches). Counters are
     NOT enforced — `max_turns` and `max_depth`/`max_children` are the caps."""
-    system_content = _harness_preamble() + "\n" + seat.system_prompt
+    system_content = _harness_preamble(seat) + "\n" + seat.system_prompt
     messages = [{"role": "system", "content": system_content}] + list(seat.history)
     local_tools = _build_tools_param(tool_specs)
     tools_param = _append_web_tools(local_tools, seat)

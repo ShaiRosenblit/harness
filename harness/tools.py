@@ -278,6 +278,22 @@ def _h_code_exec(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
     )
 
 
+def _h_use_skill(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
+    from .skills import load_skill
+    name = (args.get("name") or "").strip()
+    s = load_skill(name)
+    if s is None:
+        return ToolResult(
+            ok=False,
+            content=f"no such skill: {name!r}",
+            error="not_found",
+        )
+    # Return the body wrapped with a small header so it's obvious in the
+    # transcript what just came in.
+    header = f"# Skill: {s.name}\n_{s.description}_\n\n"
+    return ToolResult(ok=True, content=header + s.body, meta={"skill": s.name})
+
+
 def _h_bash(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
     cmd = args.get("command", "")
     proc = subprocess.run(
@@ -392,6 +408,23 @@ def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
 
 
 def register_builtins() -> None:
+    register(
+        ToolSpec(
+            name="use_skill",
+            description=(
+                "Load a skill's full procedure into your context. Use when "
+                "a skill in [available skills] matches your current task. "
+                "The skill body is returned as the tool result; follow its "
+                "steps to complete the task."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+            handler=_h_use_skill,
+        )
+    )
     register(
         ToolSpec(
             name="bash",
