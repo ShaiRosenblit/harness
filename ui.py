@@ -88,7 +88,6 @@ HELP_TEXT = """\
 
 [b]keys[/b]
 
-  [yellow]Mouse wheel[/yellow]           scroll the output
   [yellow]PageUp[/yellow] / [yellow]PageDown[/yellow]       scroll the output
   [yellow]Ctrl+Home[/yellow] / [yellow]Ctrl+End[/yellow]    jump to top / bottom (End resumes live tail)
   [yellow]Ctrl+L[/yellow]                clear the screen
@@ -96,9 +95,8 @@ HELP_TEXT = """\
 
 [b]text selection[/b]
 
-  Hold [yellow]⌥ Option[/yellow] (macOS) or [yellow]Shift[/yellow] (Linux) while dragging to let
-  the terminal do native text selection. Without the modifier the
-  mouse goes to the app (for scrolling).
+  Drag to select. [yellow]Cmd+C[/yellow] / [yellow]Ctrl+Shift+C[/yellow] to copy. The app doesn't
+  capture the mouse so your terminal handles selection natively.
 
 [b]flags[/b] (work with [cyan]/run[/cyan] and [cyan]/chat[/cyan])
 
@@ -929,11 +927,11 @@ class HarnessApp(App):
 
 
 def main() -> int:
-    # Mouse capture ON so the scroll wheel works on the output area.
-    # Terminal-native text selection still works while holding Option (⌥)
-    # on macOS or Shift on Linux — that's the standard "let the terminal
-    # see the mouse" modifier in iTerm2, Terminal.app and gnome-terminal.
-    HarnessApp().run()
+    # mouse=False so terminal-native text selection (and cmd+c / ctrl+shift+c)
+    # works on any terminal without requiring a modifier. Mouse wheel won't
+    # scroll the output as a result — use PageUp / PageDown / Ctrl+End for
+    # that (also faster than the wheel for the long logs we produce).
+    HarnessApp().run(mouse=False)
     return 0
 
 
