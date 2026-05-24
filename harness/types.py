@@ -52,6 +52,7 @@ class Seat:
     tool_timeout_s: float
     web_max_results: int
     web_search_context_size: str
+    provider: Tuple[str, ...] = ()
     history: list = field(default_factory=list)
     turns_used: int = 0
     child_count: int = 0
@@ -94,3 +95,8 @@ class Agent:
     web: Tuple[str, ...] = ()   # subset of: search, fetch  (resolved by OpenRouter)
     web_max_results: int = 4
     web_search_context_size: str = "low"   # "low" | "medium" | "high"
+    # OpenRouter provider slugs to restrict routing to (in preference order).
+    # Empty = let OpenRouter pick. Useful when a model's tool-call template
+    # is only parsed correctly by a subset of providers — e.g. Kimi K2.6
+    # served by some providers leaks `<|tool_call_begin|>...` into text.
+    provider: Tuple[str, ...] = ()

@@ -173,17 +173,33 @@ def call_model(seat: Seat, tool_specs: List[ToolSpec], log: Log) -> ModelRespons
             "messages": messages,
             "tools": [t["function"]["name"] for t in local_tools],
             "web_tools": [t["type"] for t in tools_param if t.get("type", "").startswith("openrouter:")],
+            "provider_pref": list(seat.provider) if seat.provider else None,
         },
     )
+
+    extra_body: dict = {"usage": {"include": True}}
+    if seat.provider:
+        # OpenRouter provider routing — restrict routing to the named
+        # providers in preference order. Use this when a model's tool-call
+        # template is only parsed correctly by a subset of providers (e.g.
+        # some Kimi K2.6 providers leak raw `<|tool_call_begin|>` tokens
+        # into the response content instead of returning structured
+        # tool_calls). `allow_fallbacks=False` makes failures explicit
+        # rather than silently routing to a broken provider.
+        extra_body["provider"] = {
+            "order": list(seat.provider),
+            "allow_fallbacks": False,
+        }
 
     completion = _client().chat.completions.create(
         model=seat.model,
         messages=messages,
         tools=tools_param if tools_param else None,
         tool_choice="auto" if tools_param else None,
-        extra_body={"usage": {"include": True}},
+        extra_body=extra_body,
     )
     msg = completion.choices[0].message
+    provider_used = getattr(completion, "provider", None)
     raw_msg: dict = {"role": "assistant", "content": msg.content}
     tcs: List[ModelToolCall] = []
     if getattr(msg, "tool_calls", None):
@@ -232,6 +248,7 @@ def call_model(seat: Seat, tool_specs: List[ToolSpec], log: Log) -> ModelRespons
             "usage": usage,
             "citations": citations,
             "model": seat.model,
+            "provider": provider_used,
         },
     )
     return ModelResponse(

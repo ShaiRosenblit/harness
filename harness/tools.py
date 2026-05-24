@@ -122,6 +122,7 @@ def mint_seat(
         tool_timeout_s=agent.tool_timeout_s,
         web_max_results=agent.web_max_results,
         web_search_context_size=agent.web_search_context_size,
+        provider=agent.provider,
         history=history,
     )
 
@@ -356,6 +357,7 @@ def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
         tool_timeout_s=seat.tool_timeout_s,
         web_max_results=seat.web_max_results,
         web_search_context_size=seat.web_search_context_size,
+        provider=seat.provider,
         history=[{"role": "user", "content": prompt}],
     )
 
