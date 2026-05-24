@@ -448,10 +448,15 @@ def _h_web_fetch(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
         text = re.sub(r"[ \t]+", " ", text)
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
-    MAX = 200_000
+    # Cap aggressively. The model's context window is the real constraint —
+    # a 5-turn run with 4 parallel fetches at 200 KB each fills 200 K+
+    # tokens of history. 30 KB ≈ 7.5 K tokens; long filings should be
+    # fetched in multiple targeted pieces (e.g. the specific 10-Q page or
+    # press release, not the whole IR landing page).
+    MAX = 30_000
     truncated = len(text) > MAX
     if truncated:
-        text = text[:MAX] + "\n\n[... truncated]"
+        text = text[:MAX] + "\n\n[... truncated; fetch a more specific URL or the next section]"
     header = f"URL: {final_url}\nContent-Type: {content_type}\nBytes: {len(raw)}{' (truncated)' if truncated else ''}\n\n"
     return ToolResult(ok=True, content=header + text)
 
