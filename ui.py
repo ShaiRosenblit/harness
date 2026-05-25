@@ -143,6 +143,7 @@ class SuggestingInput(Input):
 
 RUNS_DIR = ROOT / "runs"
 AGENTS_DIR = ROOT / "agents"
+PROMPTS_DIR = ROOT / "prompts"
 
 DEFAULT_MODEL = "moonshotai/kimi-k2.6"
 DEFAULT_CHAT_AGENT = "chat"
@@ -151,6 +152,7 @@ COMMANDS = (
     "help", "login", "logout", "status", "model",
     "agents", "skills", "runs", "view", "tree",
     "chat", "end", "run",
+    "prompts", "prompt", "p",
     "approve", "deny", "approvals", "auto",
     "clear", "quit", "exit",
 )
@@ -174,6 +176,8 @@ HELP_TEXT = """\
   [cyan]/chat[/cyan] [dim][agent] [flags...][/dim]              start a chat (default: chat)
   [cyan]/end[/cyan]                 end the current chat
   [cyan]/run[/cyan]  [dim]<agent> [flags...] <message...>[/dim]  one-shot task
+  [cyan]/prompts[/cyan]             list saved prompts (markdown files in [dim]prompts/[/dim])
+  [cyan]/prompt[/cyan] [dim]<name> [extra...][/dim]   send a saved prompt as a chat message ([cyan]/p[/cyan] alias)
   [cyan]/approve[/cyan] [dim]<id>[/dim]    approve a pending risky tool call
   [cyan]/deny[/cyan] [dim]<id>[/dim]       deny a pending risky tool call
   [cyan]/approvals[/cyan]           list pending + resolved approvals for this run
@@ -229,6 +233,22 @@ def load_agent(name: str) -> Agent:
     import importlib
     mod = importlib.import_module(f"agents.{name}")
     return getattr(mod, "AGENT")
+
+
+def list_prompts() -> list[str]:
+    if not PROMPTS_DIR.exists():
+        return []
+    return sorted(
+        p.stem for p in PROMPTS_DIR.glob("*.md")
+        if p.name.lower() != "readme.md"
+    )
+
+
+def load_prompt(name: str) -> Optional[str]:
+    path = PROMPTS_DIR / f"{name}.md"
+    if not path.exists():
+        return None
+    return path.read_text(encoding="utf-8").strip()
 
 
 BOOLEAN_FLAGS = {"auto-approve"}
@@ -501,6 +521,10 @@ class HarnessSuggester(Suggester):
             for r in list_runs():
                 if r.name.startswith(rest):
                     return f"{head} {r.name}"
+        if cmd in ("prompt", "p"):
+            for n in list_prompts():
+                if n.startswith(rest):
+                    return f"{head} {n}"
         return None
 
 
@@ -952,6 +976,59 @@ class HarnessApp(App):
         self._chat = None
         self._chat_agent_name = None
         self._active_run = None
+
+    # ---- /prompts, /prompt --------------------------------------------- #
+
+    def _cmd_prompts(self, _rest: str) -> None:
+        prompts = list_prompts()
+        if not prompts:
+            self._line(
+                f"[dim](no prompts yet — add markdown files to {PROMPTS_DIR})[/dim]"
+            )
+            return
+        for n in prompts:
+            path = PROMPTS_DIR / f"{n}.md"
+            try:
+                first = next(
+                    (ln.strip() for ln in path.read_text(encoding="utf-8").splitlines()
+                     if ln.strip()),
+                    "",
+                )
+            except OSError:
+                first = ""
+            preview = first[:80] + ("…" if len(first) > 80 else "")
+            self._line(f"  [cyan]{n}[/cyan]  [dim]{preview}[/dim]")
+
+    def _cmd_prompt(self, rest: str) -> None:
+        rest = rest.strip()
+        if not rest:
+            self._line("usage: [cyan]/prompt <name> [extra text...][/cyan]")
+            self._line("see [cyan]/prompts[/cyan] for available prompts")
+            return
+        parts = rest.split(None, 1)
+        name = parts[0]
+        extra = parts[1].strip() if len(parts) > 1 else ""
+        content = load_prompt(name)
+        if content is None:
+            self._line(
+                f"[red]no such prompt:[/red] {name}  "
+                f"(known: {', '.join(list_prompts()) or 'none'})"
+            )
+            return
+        message = f"{content}\n\n{extra}" if extra else content
+        if self._chat is None:
+            if not credentials.get_api_key():
+                self._line(
+                    "[red]not signed in.[/red]  use [cyan]/login <key>[/cyan] first."
+                )
+                return
+            self._cmd_chat("")
+            if self._chat is None:
+                return
+        self._send_chat(message)
+
+    def _cmd_p(self, rest: str) -> None:
+        self._cmd_prompt(rest)
 
     def _send_chat(self, user_text: str) -> None:
         if self._is_running:
