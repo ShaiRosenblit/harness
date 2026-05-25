@@ -35,7 +35,7 @@ from textual.app import App, ComposeResult  # noqa: E402
 from textual.binding import Binding  # noqa: E402
 from textual.suggester import Suggester  # noqa: E402
 from textual import events  # noqa: E402
-from textual.widgets import Footer, Header, Input, RichLog  # noqa: E402
+from textual.widgets import Footer, Header, Input, RichLog, Static  # noqa: E402
 
 
 _PASTE_MARKER_RE = re.compile(r"\[Pasted #(\d+) \+(\d+) lines\]")
@@ -565,8 +565,16 @@ class HarnessSuggester(Suggester):
 CSS = """
 Screen { layout: vertical; }
 #output { height: 1fr; padding: 0 1; }
+#status { dock: bottom; height: 1; padding: 0 1; color: $text-muted; }
+#status.busy    { color: $accent; }
+#status.stopped { color: $error; text-style: bold; }
+#status.idle    { color: $text-muted; }
 #prompt { dock: bottom; }
 """
+
+# Animation frames for the "agent is doing something" spinner. Braille
+# spinner is one cell wide and renders well in monospace terminals.
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
 class HarnessApp(App):
@@ -597,10 +605,23 @@ class HarnessApp(App):
         # `/auto on` or a per-run `--auto-approve` flag.
         self._auto_approve: bool = False
         self._telegram = None  # harness.telegram_bridge.TelegramBridge
+        # ---- live status bar state ---------------------------------- #
+        # _status_label is what the agent is currently doing, e.g.
+        # "thinking", "running code_exec". When _status_kind == "busy"
+        # the spinner animates next to it; "stopped" sticks a red
+        # banner that explains why we halted; "idle" hides the bar.
+        self._status_label: str = ""
+        self._status_kind: str = "idle"   # "idle" | "busy" | "stopped"
+        self._spinner_frame: int = 0
+        self._status_clear_at: float = 0.0  # epoch; 0 = no auto-clear
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         yield RichLog(id="output", highlight=True, markup=True, wrap=True)
+        # Live status bar between the log and the prompt. Always
+        # present so spinner / "stopped" lines have somewhere to land
+        # the instant we have something to say.
+        yield Static("", id="status", classes="idle", markup=True)
         yield SuggestingInput(
             placeholder="type a message to chat, or /help for commands  (tab to accept suggestion)",
             id="prompt",
@@ -625,11 +646,56 @@ class HarnessApp(App):
         self.query_one("#prompt", Input).focus()
         self.set_interval(0.5, self._tail_active_run)
         self.set_interval(0.4, self._check_pending_approvals)
+        # Spinner tick — runs every 100ms so the braille frames look
+        # alive without flooding the screen. _refresh_status is cheap
+        # when nothing's changed.
+        self.set_interval(0.1, self._tick_status)
 
     # ---- output ---------------------------------------------------------- #
 
     def _line(self, text: str = "") -> None:
         self.query_one("#output", RichLog).write(text)
+
+    # ---- live status bar ------------------------------------------------ #
+
+    def _set_status(self, kind: str, label: str = "", *, clear_after: float = 0.0) -> None:
+        """Update the inline status bar. `kind` is one of:
+          - "idle":    hide the bar (label ignored)
+          - "busy":    show animated spinner + label
+          - "stopped": show red bold stopped-banner with label
+        clear_after, if > 0, auto-clears to idle after that many seconds.
+        """
+        self._status_kind = kind
+        self._status_label = label
+        self._status_clear_at = time.time() + clear_after if clear_after else 0.0
+        self._refresh_status()
+
+    def _tick_status(self) -> None:
+        # Auto-clear sticky statuses (e.g. "stopped" / "ready").
+        if self._status_clear_at and time.time() >= self._status_clear_at:
+            self._status_kind = "idle"
+            self._status_label = ""
+            self._status_clear_at = 0.0
+        if self._status_kind == "busy":
+            self._spinner_frame = (self._spinner_frame + 1) % len(_SPINNER_FRAMES)
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        try:
+            bar = self.query_one("#status", Static)
+        except Exception:
+            return
+        bar.remove_class("busy", "stopped", "idle")
+        if self._status_kind == "busy":
+            bar.add_class("busy")
+            frame = _SPINNER_FRAMES[self._spinner_frame]
+            bar.update(f"{frame}  {self._status_label}")
+        elif self._status_kind == "stopped":
+            bar.add_class("stopped")
+            bar.update(f"■  stopped · {self._status_label}")
+        else:
+            bar.add_class("idle")
+            bar.update("")
 
     def _echo(self, cmd: str) -> None:
         self._line(f"[dim]›[/dim] {cmd}")
@@ -1239,6 +1305,7 @@ class HarnessApp(App):
         )
         self._chat = None
         self._chat_agent_name = None
+        self._set_status("idle")
         self._active_run = None
 
     # ---- /prompts, /prompt --------------------------------------------- #
@@ -1318,22 +1385,25 @@ class HarnessApp(App):
             f"[dim]{time.strftime('%H:%M:%S')}[/dim]"
         )
         self._is_running = True
+        self._set_status("busy", "thinking…")
         self.run_worker(self._do_chat_turn(user_text), exclusive=True, group="chat", thread=True)
 
     async def _do_chat_turn(self, user_text: str) -> None:
         try:
             chat = self._chat
             if chat is None:
-                self.call_from_thread(self._on_chat_reply, "[red]chat ended[/red]")
+                self.call_from_thread(self._on_chat_reply, "[red]chat ended[/red]", True)
                 return
             reply = chat.send(user_text)
-            self.call_from_thread(self._on_chat_reply, reply)
+            self.call_from_thread(self._on_chat_reply, reply, False)
         except Exception:
             self.call_from_thread(
-                self._on_chat_reply, f"[red]chat error:[/red]\n{traceback.format_exc()}"
+                self._on_chat_reply,
+                f"[red]chat error:[/red]\n{traceback.format_exc()}",
+                True,
             )
 
-    def _on_chat_reply(self, reply: str) -> None:
+    def _on_chat_reply(self, reply: str, errored: bool = False) -> None:
         self._tail_active_run()
         if reply:
             # Agent header was already printed in _send_chat so the
@@ -1341,6 +1411,11 @@ class HarnessApp(App):
             for line in reply.splitlines():
                 self._line(f"  {line}")
         self._is_running = False
+        if errored:
+            self._set_status("stopped", "error during turn", clear_after=8.0)
+        elif self._status_kind != "stopped":
+            # Don't trample a "stopped" already set by halt/denial.
+            self._set_status("idle")
 
     # ---- /run ----------------------------------------------------------- #
 
@@ -1411,6 +1486,7 @@ class HarnessApp(App):
         self._active_run = run_dir / "log.jsonl"
         self._active_seen_seq = 0
         self._is_running = True
+        self._set_status("busy", "thinking…")
         self.run_worker(
             self._do_run(agent, run_dir, message, auto_approve),
             exclusive=True, group="run", thread=True,
@@ -1431,28 +1507,38 @@ class HarnessApp(App):
             seat = res.root_seat
             if seat.submit_result is not None:
                 head = f"[green]✓ done[/green]  [italic]{seat.submit_result!r}[/italic]"
+                final_status = ("idle", "")
             elif seat.halt_reason:
                 head = f"[yellow]○ halt[/yellow]  [dim]{seat.halt_reason}[/dim]"
+                final_status = ("stopped", seat.halt_reason or "halt")
             else:
                 head = "[green]✓ done[/green]"
+                final_status = ("idle", "")
             summary = (
                 f"{head}\n"
                 f"  [dim]{seat.turns_used} turns · "
                 f"{seat.tokens_prompt}/{seat.tokens_completion} tok · "
                 f"${seat.cost_usd:.4f}[/dim]"
             )
-            self.call_from_thread(self._on_run_done, summary)
+            self.call_from_thread(self._on_run_done, summary, final_status)
         except Exception:
             self.call_from_thread(
-                self._on_run_done, f"[red]FAILED:[/red]\n{traceback.format_exc()}"
+                self._on_run_done,
+                f"[red]FAILED:[/red]\n{traceback.format_exc()}",
+                ("stopped", "error during run"),
             )
 
-    def _on_run_done(self, summary: str) -> None:
+    def _on_run_done(self, summary: str, final_status: tuple = ("idle", "")) -> None:
         self._tail_active_run()
         self._line(summary)
         self._line("")
         self._is_running = False
         self._run_ctx = None
+        kind, label = final_status
+        if kind == "stopped":
+            self._set_status("stopped", label, clear_after=8.0)
+        elif self._status_kind != "stopped":
+            self._set_status("idle")
 
     # ---- live tail ------------------------------------------------------ #
 
@@ -1484,7 +1570,13 @@ class HarnessApp(App):
         in_chat = self._chat is not None
         seat_prefix = f"[dim]{sid}[/dim] " if sid and sid != "s0" else ""
 
-        if t in ("model_request", "approval_decision"):
+        if t == "model_request":
+            # Dropped from the log view, but it's the clearest signal
+            # that the model is currently working — drive the spinner.
+            if self._is_running:
+                self._set_status("busy", "thinking…")
+            return
+        if t == "approval_decision":
             return
 
         if t == "model_response":
@@ -1526,6 +1618,8 @@ class HarnessApp(App):
             # The dedicated "submit" event renders right after this, so
             # skip the tool_call form to avoid showing the same thing twice.
             if tool == "submit":
+                if self._is_running:
+                    self._set_status("busy", "finishing…")
                 return
             preview = _tool_arg_preview(tool, p.get("args") or {})
             glyph = _TOOL_GLYPH.get(tool, "·")
@@ -1533,17 +1627,25 @@ class HarnessApp(App):
             if preview:
                 line += f"  [dim]{preview}[/dim]"
             self._line(line)
+            if self._is_running:
+                self._set_status("busy", f"running {glyph} {tool}…")
             return
 
         if t == "tool_result":
-            # Successes are implied by the next entry; only show failures.
+            # Once a tool finishes, the model gets the result and starts
+            # thinking about the next move — show that on the bar so the
+            # spinner doesn't freeze on "running …" between turns.
             if p.get("ok"):
+                if self._is_running:
+                    self._set_status("busy", "thinking…")
                 return
             err = (p.get("error") or "failed").splitlines()[0][:120]
             self._line(
                 f"  {seat_prefix}[red]✗[/red] [b]{p.get('tool')}[/b] "
                 f"[dim]{err}[/dim]"
             )
+            if self._is_running:
+                self._set_status("busy", f"recovering from {p.get('tool')} error…")
             return
 
         if t == "spawn":
@@ -1576,7 +1678,18 @@ class HarnessApp(App):
             # already conveys completion — second line would be noise.
             if reason == "submit":
                 return
-            self._line(f"  {seat_prefix}[red]halt[/red] [dim]{reason}[/dim]")
+            # An abnormal halt deserves a loud, sticky banner on the
+            # status bar plus a clearly-formatted log block so the user
+            # can't miss that the agent gave up.
+            self._line("")
+            self._line(
+                f"  {seat_prefix}[b white on red] ■ STOPPED [/]  "
+                f"[red]{reason}[/red]"
+            )
+            if sid and sid == "s0" or not sid:
+                # Only flip the top-level bar for the root seat; a halt
+                # in a sub-seat is the parent's problem, not the user's.
+                self._set_status("stopped", reason, clear_after=8.0)
             return
 
         if t == "denial":
