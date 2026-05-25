@@ -1383,12 +1383,12 @@ class HarnessApp(App):
             self._line(f"  {line}")
         # Open the agent's block now so the tool calls / inner thoughts
         # that stream in during the turn appear UNDER its green bar
-        # rather than dangling under the user's blue bar.
+        # rather than dangling under the user's blue bar. The timestamp
+        # is deliberately omitted here — the meaningful time is when
+        # the reply actually lands, not when the user submitted, so we
+        # print it next to the reply text in _on_chat_reply instead.
         self._line("")
-        self._line(
-            f"[b green]▌ {self._chat_agent_name or 'agent'}[/b green]  "
-            f"[dim]{time.strftime('%H:%M:%S')}[/dim]"
-        )
+        self._line(f"[b green]▌ {self._chat_agent_name or 'agent'}[/b green]")
         self._is_running = True
         self._set_status("busy", "thinking…")
         self.run_worker(self._do_chat_turn(user_text), exclusive=True, group="chat", thread=True)
@@ -1411,9 +1411,15 @@ class HarnessApp(App):
     def _on_chat_reply(self, reply: str, errored: bool = False) -> None:
         self._tail_active_run()
         if reply:
-            # Agent header was already printed in _send_chat so the
-            # activity stream sits under it; just append the reply.
-            for line in reply.splitlines():
+            # Agent header was already printed in _send_chat. The reply
+            # arrives now — stamp it with the *current* time so the
+            # timestamp reflects when the agent actually answered, not
+            # when the user submitted the turn.
+            lines = reply.splitlines() or [""]
+            self._line(
+                f"  [dim]{time.strftime('%H:%M:%S')}[/dim]  {lines[0]}"
+            )
+            for line in lines[1:]:
                 self._line(f"  {line}")
         self._is_running = False
         if errored:
