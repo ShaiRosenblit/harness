@@ -237,9 +237,12 @@ class TelegramBridge:
             await app.start()
             await app.updater.start_polling(drop_pending_updates=True)
         except InvalidToken:
+            from . import credentials
+            shown = credentials.mask(self.token)
             self.on_log(
-                "invalid bot token — Telegram rejected it. "
-                "fix with /telegram login <token> (get a fresh one from @BotFather)."
+                f"invalid bot token — Telegram rejected `{shown}` "
+                f"({len(self.token)} chars). check what was saved with /telegram, "
+                "then /telegram login <token> with a fresh one from @BotFather."
             )
             try:
                 await app.shutdown()
