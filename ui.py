@@ -521,7 +521,7 @@ class HarnessSuggester(Suggester):
             for r in list_runs():
                 if r.name.startswith(rest):
                     return f"{head} {r.name}"
-        if cmd in ("prompt", "p"):
+        if cmd in ("prompt", "prompts", "p"):
             for n in list_prompts():
                 if n.startswith(rest):
                     return f"{head} {n}"
@@ -979,7 +979,12 @@ class HarnessApp(App):
 
     # ---- /prompts, /prompt --------------------------------------------- #
 
-    def _cmd_prompts(self, _rest: str) -> None:
+    def _cmd_prompts(self, rest: str) -> None:
+        # With an argument, behave like /prompt — easy mistake to make,
+        # and tab-completion suggests prompt names after `/prompts ` too.
+        if rest.strip():
+            self._cmd_prompt(rest)
+            return
         prompts = list_prompts()
         if not prompts:
             self._line(
