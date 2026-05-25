@@ -300,6 +300,60 @@ def apply_overrides(agent: Agent, overrides: dict) -> Agent:
     return new_agent
 
 
+# Friendly icons for tool_call rendering in the live (compact) view.
+# Unknown tools fall back to a plain bullet — keep this small and stable.
+_TOOL_GLYPH = {
+    "code_exec":          "⚙",
+    "bash":               "$",
+    "spawn":              "↳",
+    "submit":             "✓",
+    "web_search":         "🔍",
+    "web:search":         "🔍",
+    "search":             "🔍",
+    "web_fetch":          "🌐",
+    "web:fetch":          "🌐",
+    "fetch":              "🌐",
+    "read_file":          "📄",
+    "write_file":         "✎",
+}
+
+
+def _tool_arg_preview(tool: str, args: dict) -> str:
+    """One-line, human-readable hint for what a tool call is doing.
+    Returns "" when there's nothing useful to show."""
+    if not isinstance(args, dict):
+        return ""
+    if tool == "code_exec":
+        code = (args.get("code") or "").strip()
+        first = next((ln for ln in code.splitlines() if ln.strip()), "")
+        return first[:100]
+    if tool == "bash":
+        cmd = (args.get("command") or args.get("cmd") or "").strip()
+        first = next((ln for ln in cmd.splitlines() if ln.strip()), "")
+        return first[:100]
+    if tool == "spawn":
+        agent = args.get("agent") or args.get("name") or ""
+        msg = (
+            args.get("prompt") or args.get("message")
+            or args.get("task") or ""
+        ).strip().splitlines()[:1]
+        msg = msg[0] if msg else ""
+        if agent and msg:
+            return f"{agent}  {msg[:80]}"
+        return (agent or msg)[:100]
+    if tool == "submit":
+        result = (args.get("result") or args.get("text") or "").strip()
+        return result.splitlines()[0][:100] if result else ""
+    if tool in ("search", "web_search", "web:search"):
+        return (args.get("query") or args.get("q") or "")[:100]
+    if tool in ("fetch", "web_fetch", "web:fetch"):
+        return (args.get("url") or "")[:100]
+    if tool in ("read_file", "write_file"):
+        return (args.get("path") or args.get("file") or "")[:100]
+    j = json.dumps(args, ensure_ascii=False)
+    return j[:100] + ("…" if len(j) > 100 else "")
+
+
 def summarize_entry(e: dict) -> str:
     t = e["type"]
     p = e.get("payload", {}) or {}
@@ -869,15 +923,18 @@ class HarnessApp(App):
         self._chat_agent_name = agent_name
         self._active_run = run_dir / "log.jsonl"
         self._active_seen_seq = 0
-        auto_note = "  [red](auto-approve ON)[/red]" if auto_approve else ""
+        bits = [f"[cyan]{agent_name}[/cyan]", f"[b]{agent.model}[/b]"]
+        if agent.tools:
+            bits.append("tools: " + ", ".join(agent.tools))
+        if agent.web:
+            bits.append("web: " + ", ".join(agent.web))
+        if auto_approve:
+            bits.append("[red]auto-approve[/red]")
+        self._line(f"[green]●[/green] chat with " + "  [dim]·[/dim]  ".join(bits))
+        self._line(f"  [dim]{run_dir}[/dim]")
         self._line(
-            f"[b green]chat started[/b green]   agent=[cyan]{agent_name}[/cyan]  "
-            f"model=[b]{agent.model}[/b]  tools={list(agent.tools)}  "
-            + (f"web={list(agent.web)}" if agent.web else "")
-            + auto_note
+            "  [dim]type a message, or [/dim][cyan]/end[/cyan][dim] to stop[/dim]"
         )
-        self._line(f"[dim]   {run_dir}[/dim]")
-        self._line("[dim]type a message (no /), or [/dim][cyan]/end[/cyan][dim] to stop.[/dim]")
 
     def _cmd_end(self, _rest: str) -> None:
         if self._chat is None:
@@ -889,8 +946,8 @@ class HarnessApp(App):
             pass
         seat = self._chat.seat
         self._line(
-            f"[b yellow]chat ended[/b yellow]   turns={seat.turns_used}  "
-            f"spent=$[b]{seat.cost_usd:.4f}[/b]"
+            f"[yellow]○[/yellow] chat ended  "
+            f"[dim]· {seat.turns_used} turns · ${seat.cost_usd:.4f}[/dim]"
         )
         self._chat = None
         self._chat_agent_name = None
@@ -900,7 +957,12 @@ class HarnessApp(App):
         if self._is_running:
             self._line("[yellow]busy[/yellow] — wait for the current turn to finish")
             return
-        self._line(f"[dim]{time.strftime('%H:%M:%S')}[/dim]  [b cyan]you[/b cyan]  {user_text}")
+        self._line("")
+        self._line(
+            f"[b cyan]▌ you[/b cyan]  [dim]{time.strftime('%H:%M:%S')}[/dim]"
+        )
+        for line in user_text.splitlines() or [""]:
+            self._line(f"  {line}")
         self._is_running = True
         self.run_worker(self._do_chat_turn(user_text), exclusive=True, group="chat", thread=True)
 
@@ -920,7 +982,13 @@ class HarnessApp(App):
     def _on_chat_reply(self, reply: str) -> None:
         self._tail_active_run()
         if reply:
-            self._line(f"[dim]{time.strftime('%H:%M:%S')}[/dim]  [b green]agent[/b green]  {reply}")
+            self._line("")
+            self._line(
+                f"[b green]▌ {self._chat_agent_name or 'agent'}[/b green]  "
+                f"[dim]{time.strftime('%H:%M:%S')}[/dim]"
+            )
+            for line in reply.splitlines():
+                self._line(f"  {line}")
         self._is_running = False
 
     # ---- /run ----------------------------------------------------------- #
@@ -980,14 +1048,15 @@ class HarnessApp(App):
             shutil.rmtree(run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        auto_note = "  [red](auto-approve ON)[/red]" if auto_approve else ""
-        self._line(
-            f"[b]→ running[/b] [cyan]{agent_name}[/cyan]  model=[b]{agent.model}[/b]  "
-            f"tools={list(agent.tools)}"
-            + (f"  web={list(agent.web)}" if agent.web else "")
-            + auto_note
-        )
-        self._line(f"[dim]   {run_dir}[/dim]")
+        bits = [f"[cyan]{agent_name}[/cyan]", f"[b]{agent.model}[/b]"]
+        if agent.tools:
+            bits.append("tools: " + ", ".join(agent.tools))
+        if agent.web:
+            bits.append("web: " + ", ".join(agent.web))
+        if auto_approve:
+            bits.append("[red]auto-approve[/red]")
+        self._line(f"[green]▶[/green] running " + "  [dim]·[/dim]  ".join(bits))
+        self._line(f"  [dim]{run_dir}[/dim]")
         self._active_run = run_dir / "log.jsonl"
         self._active_seen_seq = 0
         self._is_running = True
@@ -1009,11 +1078,17 @@ class HarnessApp(App):
                 auto_approve=auto_approve,
             )
             seat = res.root_seat
+            if seat.submit_result is not None:
+                head = f"[green]✓ done[/green]  [italic]{seat.submit_result!r}[/italic]"
+            elif seat.halt_reason:
+                head = f"[yellow]○ halt[/yellow]  [dim]{seat.halt_reason}[/dim]"
+            else:
+                head = "[green]✓ done[/green]"
             summary = (
-                f"[b green]done[/b green]   submit={seat.submit_result!r}   "
-                f"halt={seat.halt_reason}   turns={seat.turns_used}   "
-                f"tokens={seat.tokens_prompt}/{seat.tokens_completion}   "
-                f"spent=$[b]{seat.cost_usd:.4f}[/b]"
+                f"{head}\n"
+                f"  [dim]{seat.turns_used} turns · "
+                f"{seat.tokens_prompt}/{seat.tokens_completion} tok · "
+                f"${seat.cost_usd:.4f}[/dim]"
             )
             self.call_from_thread(self._on_run_done, summary)
         except Exception:
@@ -1036,12 +1111,110 @@ class HarnessApp(App):
         entries = read_log(self._active_run)
         new = [e for e in entries if e.get("seq", 0) > self._active_seen_seq]
         for e in new:
-            self._render_entry(e)
+            self._render_live(e)
             self._active_seen_seq = max(self._active_seen_seq, e.get("seq", 0))
 
     def _render_entry(self, e: dict) -> None:
+        """Verbose, debug-style row used by `/view` for log replay."""
         sid = e["seat_id"] or "-"
         self._line(f"  [dim]{e['seq']:>3}[/dim] [cyan]{sid:<7}[/cyan] {summarize_entry(e)}")
+
+    def _render_live(self, e: dict) -> None:
+        """Compact, chat-style row used during /chat and /run live tail.
+
+        Hides bookkeeping events (model_request, approval_decision, ok
+        tool_result) and renders the rest with friendly icons instead of
+        raw type names. The seq number is dropped; seat id appears only
+        when it's not the root seat (i.e. sub-agents in a spawn tree).
+        """
+        t = e["type"]
+        p = e.get("payload", {}) or {}
+        sid = e.get("seat_id") or ""
+        in_chat = self._chat is not None
+        seat_prefix = f"[dim]{sid}[/dim] " if sid and sid != "s0" else ""
+
+        if t in ("model_request", "approval_decision"):
+            return
+
+        if t == "model_response":
+            # In chat mode the final reply is printed by _on_chat_reply,
+            # so showing model_response text would duplicate it. In /run
+            # there's no separate reply line, so surface intermediate text.
+            if in_chat:
+                return
+            text = (p.get("text") or "").strip()
+            if not text:
+                return
+            if len(text) > 500:
+                text = text[:500].rstrip() + "…"
+            for line in text.splitlines():
+                self._line(f"  {seat_prefix}{line}")
+            return
+
+        if t == "tool_call":
+            tool = p.get("tool") or "?"
+            # The dedicated "submit" event renders right after this, so
+            # skip the tool_call form to avoid showing the same thing twice.
+            if tool == "submit":
+                return
+            preview = _tool_arg_preview(tool, p.get("args") or {})
+            glyph = _TOOL_GLYPH.get(tool, "·")
+            line = f"  {seat_prefix}[dim]{glyph}[/dim] [b cyan]{tool}[/b cyan]"
+            if preview:
+                line += f"  [dim]{preview}[/dim]"
+            self._line(line)
+            return
+
+        if t == "tool_result":
+            # Successes are implied by the next entry; only show failures.
+            if p.get("ok"):
+                return
+            err = (p.get("error") or "failed").splitlines()[0][:120]
+            self._line(
+                f"  {seat_prefix}[red]✗[/red] [b]{p.get('tool')}[/b] "
+                f"[dim]{err}[/dim]"
+            )
+            return
+
+        if t == "spawn":
+            child = p.get("child_id")
+            depth = p.get("depth")
+            self._line(
+                f"  {seat_prefix}[magenta]↳[/magenta] spawn "
+                f"[cyan]{child}[/cyan] [dim]depth={depth}[/dim]"
+            )
+            return
+
+        if t == "submit":
+            result = (p.get("result") or "").strip()
+            if len(result) > 200:
+                result = result[:200].rstrip() + "…"
+            self._line(
+                f"  {seat_prefix}[green]✓ submit[/green]"
+                + (f"  [italic dim]{result}[/italic dim]" if result else "")
+            )
+            return
+
+        if t == "halt":
+            reason = p.get("reason") or ""
+            # A normal end-of-seat halt always trails a submit event that
+            # already conveys completion — second line would be noise.
+            if reason == "submit":
+                return
+            self._line(f"  {seat_prefix}[red]halt[/red] [dim]{reason}[/dim]")
+            return
+
+        if t == "denial":
+            reason = p.get("reason") or ""
+            tool = p.get("tool") or ""
+            self._line(
+                f"  {seat_prefix}[yellow]denied[/yellow] "
+                f"[dim]{tool}: {reason}[/dim]"
+            )
+            return
+
+        # Fallback for any future event types — keep it quiet but visible.
+        self._line(f"  {seat_prefix}[dim]{t}[/dim]")
 
     # ---- misc ----------------------------------------------------------- #
 
