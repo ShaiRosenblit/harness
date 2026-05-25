@@ -61,6 +61,59 @@ def clear_api_key() -> None:
     save(creds)
 
 
+# ---- Telegram bridge --------------------------------------------------- #
+# Stored in the same credentials.json so /telegram login persists across
+# UI restarts, exactly like /login does for the OpenRouter key. Env vars
+# (TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOWED_CHAT_IDS) still win if set, so
+# a one-off shell export overrides the saved value.
+
+
+def get_telegram_token() -> Optional[str]:
+    env = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if env:
+        return env.strip()
+    return load().get("telegram_bot_token")
+
+
+def save_telegram_token(token: str) -> Path:
+    creds = load()
+    creds["telegram_bot_token"] = token.strip()
+    return save(creds)
+
+
+def clear_telegram_token() -> None:
+    creds = load()
+    creds.pop("telegram_bot_token", None)
+    save(creds)
+
+
+def get_telegram_allowed_ids() -> list[int]:
+    """Return allowed numeric Telegram chat/user ids. Env wins if set."""
+    raw = os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS")
+    if raw is None:
+        raw_list = load().get("telegram_allowed_chat_ids") or []
+        # Stored as a list of ints already; tolerate strings too.
+        return [int(x) for x in raw_list]
+    out: list[int] = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if tok:
+            out.append(int(tok))
+    return out
+
+
+def save_telegram_allowed_ids(ids: list[int]) -> Path:
+    creds = load()
+    creds["telegram_allowed_chat_ids"] = [int(x) for x in ids]
+    return save(creds)
+
+
+def clear_telegram_allowed_ids() -> None:
+    creds = load()
+    creds.pop("telegram_allowed_chat_ids", None)
+    save(creds)
+
+
 def inject_env() -> bool:
     """If a key is saved (and the env var isn't already set), inject it into
     os.environ so harness.model._client() can pick it up. Returns True if a
