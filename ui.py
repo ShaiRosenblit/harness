@@ -924,15 +924,34 @@ class HarnessApp(App):
         if not token:
             self._line("usage: [cyan]/telegram login <bot-token>[/cyan]   (get one from @BotFather)")
             return
-        if len(token) < 20 or ":" not in token:
-            self._line("[red]that doesn't look like a real bot token (expected `<id>:<secret>`)[/red]")
+        # Real Telegram bot tokens look like `<digits>:<35+ url-safe chars>`.
+        # Reject anything that isn't shaped that way before hitting the API.
+        import re
+        cleaned = "".join(token.split())
+        m = re.fullmatch(r"\d+:[A-Za-z0-9_-]{30,}", cleaned)
+        if not m:
+            self._line(
+                f"[red]that doesn't look like a real bot token[/red] "
+                f"(got {len(cleaned)} chars, expected `<id>:<35+ chars>`)"
+            )
+            self._line(
+                "[dim]from @BotFather, look for the line under "
+                "[i]Use this token to access the HTTP API:[/i][/dim]"
+            )
             return
         try:
-            path = credentials.save_telegram_token(token)
+            path = credentials.save_telegram_token(cleaned)
         except OSError as e:
             self._line(f"[red]failed to save:[/red] {e}")
             return
-        self._line(f"[green]✓ telegram token saved[/green]   token=[dim]{credentials.mask(token)}[/dim]")
+        # Read it back so the user can see exactly what got stored —
+        # invaluable when copy-paste sneaks in stray characters.
+        saved = credentials.get_telegram_token() or ""
+        self._line(
+            f"[green]✓ telegram token saved[/green]   "
+            f"token=[dim]{credentials.mask(saved)}[/dim]  "
+            f"[dim]({len(saved)} chars)[/dim]"
+        )
         self._line(f"[dim]saved to {path}[/dim]")
         if not credentials.get_telegram_allowed_ids():
             self._line(

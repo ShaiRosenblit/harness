@@ -77,7 +77,11 @@ def get_telegram_token() -> Optional[str]:
 
 def save_telegram_token(token: str) -> Path:
     creds = load()
-    creds["telegram_bot_token"] = token.strip()
+    # Strip every kind of whitespace — pasted tokens routinely carry
+    # trailing newlines, NBSPs, or stray tabs from copy. A real token
+    # has no internal whitespace, so this is safe.
+    cleaned = "".join(token.split())
+    creds["telegram_bot_token"] = cleaned
     return save(creds)
 
 
