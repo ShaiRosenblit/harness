@@ -652,8 +652,12 @@ class HarnessApp(App):
             inp.value = ""
         if not raw:
             return
-        self._echo(raw if "\n" not in raw
-                   else raw.split("\n", 1)[0] + f" [+{raw.count(chr(10))} lines]")
+        # Echo slash commands so the user gets confirmation they ran;
+        # chat messages render their own "▌ you …" block in _send_chat,
+        # so echoing here would duplicate the line.
+        if raw.startswith("/"):
+            self._echo(raw if "\n" not in raw
+                       else raw.split("\n", 1)[0] + f" [+{raw.count(chr(10))} lines]")
         try:
             self._dispatch(raw)
         except Exception:
@@ -1305,6 +1309,14 @@ class HarnessApp(App):
         )
         for line in user_text.splitlines() or [""]:
             self._line(f"  {line}")
+        # Open the agent's block now so the tool calls / inner thoughts
+        # that stream in during the turn appear UNDER its green bar
+        # rather than dangling under the user's blue bar.
+        self._line("")
+        self._line(
+            f"[b green]▌ {self._chat_agent_name or 'agent'}[/b green]  "
+            f"[dim]{time.strftime('%H:%M:%S')}[/dim]"
+        )
         self._is_running = True
         self.run_worker(self._do_chat_turn(user_text), exclusive=True, group="chat", thread=True)
 
@@ -1324,11 +1336,8 @@ class HarnessApp(App):
     def _on_chat_reply(self, reply: str) -> None:
         self._tail_active_run()
         if reply:
-            self._line("")
-            self._line(
-                f"[b green]▌ {self._chat_agent_name or 'agent'}[/b green]  "
-                f"[dim]{time.strftime('%H:%M:%S')}[/dim]"
-            )
+            # Agent header was already printed in _send_chat so the
+            # activity stream sits under it; just append the reply.
             for line in reply.splitlines():
                 self._line(f"  {line}")
         self._is_running = False
