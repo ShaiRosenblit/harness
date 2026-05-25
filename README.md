@@ -14,16 +14,22 @@ pyproject.toml
 
 ## Install
 
+This project uses [uv](https://docs.astral.sh/uv/) for Python and dependency
+management. Install uv (`brew install uv` or see the uv docs), then:
+
 ```
-pip install -e .
+uv sync
 ```
+
+That creates `.venv/` and installs everything from `uv.lock`. No manual
+`python -m venv` or `pip install` needed.
 
 Get an OpenRouter API key at <https://openrouter.ai/keys>.
 
 ## Run
 
 ```
-python3 ui.py
+uv run ui.py
 /login sk-or-v1-...        # one-time; saves to ~/.config/harness/credentials.json (0600)
 what is 7 ** 11?           # plain text -> auto-starts a chat
 /end                       # end the chat
