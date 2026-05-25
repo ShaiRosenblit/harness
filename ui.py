@@ -1024,19 +1024,23 @@ class HarnessApp(App):
             )
             return
         try:
-            path = credentials.save_telegram_token(cleaned)
+            info = credentials.save_telegram_token_with_info(cleaned)
         except OSError as e:
             self._line(f"[red]failed to save:[/red] {e}")
             return
-        # Read it back so the user can see exactly what got stored —
-        # invaluable when copy-paste sneaks in stray characters.
-        saved = credentials.get_telegram_token() or ""
+        saved = info["stored"]
         self._line(
             f"[green]✓ telegram token saved[/green]   "
             f"token=[dim]{credentials.mask(saved)}[/dim]  "
-            f"[dim]({len(saved)} chars)[/dim]"
+            f"[dim]({info['cleaned_len']} chars)[/dim]"
         )
-        self._line(f"[dim]saved to {path}[/dim]")
+        if info["deduped"]:
+            self._line(
+                f"[yellow]⚠ your paste looked doubled "
+                f"({info['raw_len']} → {info['cleaned_len']} chars after dedup) — "
+                "kept the first half. run [cyan]/telegram test[/cyan] to verify.[/yellow]"
+            )
+        self._line(f"[dim]saved to {credentials.CREDENTIALS_PATH}[/dim]")
         if not credentials.get_telegram_allowed_ids():
             self._line(
                 "[dim]next:[/dim] [cyan]/telegram allow <your-telegram-id>[/cyan]  "

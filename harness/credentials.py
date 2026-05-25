@@ -76,18 +76,46 @@ def get_telegram_token() -> Optional[str]:
 
 
 def save_telegram_token(token: str) -> Path:
-    creds = load()
+    """Save the token, with paste-corruption defenses, and return its path."""
+    save_telegram_token_with_info(token)
+    return CREDENTIALS_PATH
+
+
+def save_telegram_token_with_info(token: str) -> dict:
+    """Save the token; return diagnostics about cleanup steps applied so the
+    UI can warn the user (e.g. "your paste was doubled — I kept the first half").
+
+    Diagnostics dict keys: raw_len, cleaned_len, deduped (bool), stored.
+    """
+    import re
+    raw_len = len(token)
     # Strip every kind of whitespace — pasted tokens routinely carry
     # trailing newlines, NBSPs, or stray tabs from copy. A real token
     # has no internal whitespace, so this is safe. str.split() handles
     # ASCII + most Unicode whitespace; we additionally strip the common
     # zero-width / formatting chars that .isspace() returns False on but
     # routinely sneak in via browser copy (BOM, ZWSP, ZWNJ, ZWJ, LRM/RLM).
-    import re
     cleaned = "".join(token.split())
     cleaned = re.sub(r"[​‌‍⁠﻿‎‏]", "", cleaned)
+    # Some terminals double-paste under bracketed-paste edge cases (notably
+    # macOS Terminal with certain shell setups) — the user sees a 92-char
+    # string that is literally `<46-char-token><46-char-token>`. If we
+    # detect an exact end-to-end duplicate, dedupe. This is safe: a real
+    # token concatenated with itself is never itself a valid token.
+    deduped = False
+    n = len(cleaned)
+    if n >= 20 and n % 2 == 0 and cleaned[:n // 2] == cleaned[n // 2:]:
+        cleaned = cleaned[: n // 2]
+        deduped = True
+    creds = load()
     creds["telegram_bot_token"] = cleaned
-    return save(creds)
+    save(creds)
+    return {
+        "raw_len": raw_len,
+        "cleaned_len": len(cleaned),
+        "deduped": deduped,
+        "stored": cleaned,
+    }
 
 
 def clear_telegram_token() -> None:
