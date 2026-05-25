@@ -57,14 +57,23 @@ class SuggestingInput(Input):
     BINDINGS = [
         Binding("tab",  "cursor_right", "accept suggestion",
                 show=False, priority=True),
-        Binding("up",   "history_prev", "↑ history",
-                show=False, priority=True),
-        Binding("down", "history_next", "↓ history",
-                show=False, priority=True),
+        # ↑/↓ are dual-purpose: history nav when there is something to
+        # navigate, otherwise fall through to the App's scroll action so
+        # the mouse wheel (which alt-scroll-mode translates to ↑/↓) can
+        # scroll the conversation log. Ctrl+P / Ctrl+N always do history.
+        Binding("up",     "history_prev",       "↑ history", show=False, priority=True),
+        Binding("down",   "history_next",       "↓ history", show=False, priority=True),
+        Binding("ctrl+p", "force_history_prev", show=False, priority=True),
+        Binding("ctrl+n", "force_history_next", show=False, priority=True),
     ]
 
     # Defense window for double-fire pastes (see _on_paste below).
     _PASTE_DEDUP_WINDOW_S = 0.5
+    # Below this length we won't collapse "ABCABC" → "ABC" — too risky
+    # to mistake a legitimate short repeating paste for a terminal-doubled
+    # one. Empirically, real-world doubled pastes are token-length or
+    # longer (a Telegram bot token is 46 chars), so 10 is a safe floor.
+    _PASTE_HALVES_DEDUP_MIN_LEN = 10
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -80,6 +89,15 @@ class SuggestingInput(Input):
         self._last_paste_at: float = 0.0
 
     def _on_paste(self, event: events.Paste) -> None:
+        # Textual dispatches _on_paste through the *entire* MRO (see
+        # textual/message_pump.py:_get_dispatch_methods — it iterates
+        # cls.__mro__ and yields every matching method). event.stop()
+        # only halts bubbling, not parent-class dispatch. Without
+        # prevent_default(), Input._on_paste also runs and inserts
+        # event.text.splitlines()[0] on top of whatever we inserted —
+        # which is why a single paste of "abc" produced "abcabc". Call
+        # prevent_default() up front so the parent handler is skipped.
+        event.prevent_default()
         text = event.text or ""
         if not text:
             event.stop()
@@ -101,6 +119,25 @@ class SuggestingInput(Input):
             return
         self._last_paste_text = text
         self._last_paste_at = now
+        # Defense against the other doubling mode: a single Paste event
+        # whose payload is already concatenated with itself (some terminals
+        # / clipboard managers do this inside one bracketed-paste pair, so
+        # the rapid-fire dedup above never sees a second event). If text
+        # is long enough that two-halves-identical can't be a coincidence,
+        # collapse to the first half and tell the user we did.
+        n = len(text)
+        if n >= self._PASTE_HALVES_DEDUP_MIN_LEN and n % 2 == 0 \
+                and text[: n // 2] == text[n // 2:]:
+            text = text[: n // 2]
+            try:
+                app = self.app
+                if app is not None and hasattr(app, "_line"):
+                    app._line(
+                        f"[yellow]⚠ paste looked doubled "
+                        f"({n} → {len(text)} chars); kept the first half[/yellow]"
+                    )
+            except Exception:
+                pass
         if "\n" in text:
             paste_id = len(self._pastes) + 1
             self._pastes[paste_id] = text
@@ -133,8 +170,36 @@ class SuggestingInput(Input):
         return expanded
 
     # ---- history navigation ------------------------------------------- #
+    # When the input is empty and we are NOT already navigating history,
+    # ↑/↓ defer to the App's scroll-the-log actions instead. That keeps
+    # the mouse wheel (which terminal alt-scroll-mode translates into ↑/↓
+    # keystrokes) usable for reading back through a long conversation.
+    # Ctrl+P / Ctrl+N still force history nav regardless of state.
+
+    def _scroll_fallthrough(self) -> bool:
+        return not self.value and self._history_idx == len(self._history)
+
+    def _app_scroll(self, action: str) -> None:
+        try:
+            handler = getattr(self.app, action, None)
+            if callable(handler):
+                handler()
+        except Exception:
+            pass
 
     def action_history_prev(self) -> None:
+        if self._scroll_fallthrough():
+            self._app_scroll("action_scroll_one_up")
+            return
+        self.action_force_history_prev()
+
+    def action_history_next(self) -> None:
+        if self._scroll_fallthrough():
+            self._app_scroll("action_scroll_one_down")
+            return
+        self.action_force_history_next()
+
+    def action_force_history_prev(self) -> None:
         if not self._history:
             return
         if self._history_idx == len(self._history):
@@ -148,7 +213,7 @@ class SuggestingInput(Input):
             self._pastes = dict(pastes)
             self.cursor_position = len(self.value)
 
-    def action_history_next(self) -> None:
+    def action_force_history_next(self) -> None:
         if not self._history:
             return
         if self._history_idx < len(self._history):
@@ -214,15 +279,17 @@ HELP_TEXT = """\
 
 [b]keyboard[/b]
 
-  [yellow]↑[/yellow] / [yellow]↓[/yellow]                  previous / next command (shell history)
+  [yellow]↑[/yellow] / [yellow]↓[/yellow]                  shell history (or scroll the log if input is empty)
+  [yellow]Ctrl+P[/yellow] / [yellow]Ctrl+N[/yellow]        shell history (always, even with empty input)
   [yellow]Tab[/yellow]                   accept autocomplete suggestion
   [yellow]PageUp[/yellow] / [yellow]PageDown[/yellow]       scroll the output
   [yellow]Ctrl+Home[/yellow] / [yellow]Ctrl+End[/yellow]    top / bottom (End resumes live tail)
   [yellow]Ctrl+L[/yellow]                clear the screen
 
-[b]text selection[/b]
+[b]mouse[/b]
 
-  Drag to select. [yellow]Cmd+C[/yellow] / [yellow]Ctrl+Shift+C[/yellow] to copy. Terminal-native.
+  [yellow]Wheel up/down[/yellow]         scroll the output (via terminal alt-scroll mode)
+  Drag to select; [yellow]Cmd+C[/yellow] / [yellow]Ctrl+Shift+C[/yellow] to copy (terminal-native).
 
 [b]flags[/b] (work with [cyan]/run[/cyan] and [cyan]/chat[/cyan])
 
@@ -586,11 +653,20 @@ class HarnessApp(App):
     CSS = CSS
     TITLE = "harness"
     SUB_TITLE = "interactive agent harness"
+    # Textual's built-in command palette is bound to Ctrl+P by default,
+    # which would swallow our readline-style Ctrl+P history binding on the
+    # prompt. We have our own slash-command system (/help, /chat, …) so the
+    # palette is redundant — disable it to free the key.
+    ENABLE_COMMAND_PALETTE = False
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("ctrl+l", "clear", "Clear"),
-        # ↑/↓ are owned by SuggestingInput for command history (shell-like).
-        # Log scrolling uses PageUp/PageDown + Ctrl+Home/End instead.
+        # ↑/↓ are owned by SuggestingInput for command history when there's
+        # something to navigate; SuggestingInput.action_history_prev/next
+        # falls through to the actions below when the input is empty, so
+        # the mouse wheel (via alt-scroll-mode ↑/↓) keeps scrolling the log.
+        Binding("up",        "scroll_one_up",   show=False),
+        Binding("down",      "scroll_one_down", show=False),
         Binding("pageup",    "scroll_up",     "↑ page"),
         Binding("pagedown",  "scroll_down",   "↓ page"),
         Binding("ctrl+home", "scroll_top",    "top"),
@@ -655,6 +731,11 @@ class HarnessApp(App):
         # alive without flooding the screen. _refresh_status is cheap
         # when nothing's changed.
         self.set_interval(0.1, self._tick_status)
+        # ?1007h = enable alternate-scroll-mode: terminal converts wheel
+        # events into ↑/↓ arrow keystrokes. Lets the wheel scroll the log
+        # while leaving normal mouse clicks/drags to the terminal for
+        # native text selection.
+        self._enable_alt_scroll()
 
     # ---- output ---------------------------------------------------------- #
 
@@ -1751,6 +1832,17 @@ class HarnessApp(App):
         if out.is_vertical_scroll_end:
             out.auto_scroll = True
 
+    def action_scroll_one_up(self) -> None:
+        out = self.query_one("#output", RichLog)
+        out.auto_scroll = False
+        out.scroll_up()
+
+    def action_scroll_one_down(self) -> None:
+        out = self.query_one("#output", RichLog)
+        out.scroll_down()
+        if out.is_vertical_scroll_end:
+            out.auto_scroll = True
+
     def action_scroll_top(self) -> None:
         out = self.query_one("#output", RichLog)
         out.auto_scroll = False
@@ -1760,6 +1852,34 @@ class HarnessApp(App):
         out = self.query_one("#output", RichLog)
         out.scroll_end()
         out.auto_scroll = True
+
+    # ---- alt scroll mode (?1007h) -------------------------------------- #
+    # Translates terminal mouse wheel events into ↑/↓ arrow keys while
+    # leaving clicks/drags to the terminal (so native text selection keeps
+    # working). Supported by xterm, iTerm2, gnome-terminal, kitty, alacritty,
+    # wezterm. Terminal.app supports it but the default profile may have it
+    # off — most users won't need to change anything.
+
+    def _enable_alt_scroll(self) -> None:
+        self._write_raw("\x1b[?1007h")
+
+    def _disable_alt_scroll(self) -> None:
+        self._write_raw("\x1b[?1007l")
+
+    def _write_raw(self, seq: str) -> None:
+        try:
+            self._driver.write(seq)
+            self._driver.flush()
+        except Exception:
+            try:
+                import sys
+                sys.stdout.write(seq)
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+    def on_unmount(self) -> None:
+        self._disable_alt_scroll()
 
 
 def main() -> int:
