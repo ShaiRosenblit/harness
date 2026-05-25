@@ -182,6 +182,7 @@ HELP_TEXT = """\
   [cyan]/telegram[/cyan] [dim]status|start|stop[/dim]   mirror the UI on Telegram
   [cyan]/telegram login[/cyan] [dim]<token>[/dim]      save bot token (from @BotFather)
   [cyan]/telegram allow[/cyan] [dim]<id>[,<id>...][/dim]   set allowed numeric chat ids ([dim]-[/dim] to clear)
+  [cyan]/telegram test[/cyan]            one-shot getMe call — verify the saved token without polling
   [cyan]/clear[/cyan] · [cyan]/help[/cyan] · [cyan]/quit[/cyan]
 
 [b]keyboard[/b]
@@ -847,6 +848,9 @@ class HarnessApp(App):
         if sub == "allow":
             self._telegram_allow(arg)
             return
+        if sub == "test":
+            self._telegram_test()
+            return
         if sub == "stop":
             if not (self._telegram and self._telegram.is_running()):
                 self._line("[dim]telegram bridge not running[/dim]")
@@ -856,7 +860,7 @@ class HarnessApp(App):
             self._line("[yellow]telegram bridge stopped[/yellow]")
             return
         if sub != "start":
-            self._line(f"[red]unknown:[/red] /telegram {sub!r} — try start|stop|status|login|logout|allow")
+            self._line(f"[red]unknown:[/red] /telegram {sub!r} — try start|stop|status|login|logout|allow|test")
             return
 
         if self._telegram and self._telegram.is_running():
@@ -909,7 +913,17 @@ class HarnessApp(App):
         self._line(f"telegram: {state}")
         token = credentials.get_telegram_token()
         if token:
-            self._line(f"  token: [dim]{credentials.mask(token)}[/dim]")
+            note = ""
+            if len(token) < 30:
+                note = "  [yellow](short — real tokens are ~46 chars)[/yellow]"
+            elif len(token) > 60:
+                note = "  [yellow](unusually long — typical is ~46, double check for double-paste)[/yellow]"
+            colons = token.count(":")
+            colon_note = "" if colons == 1 else f"  [yellow]({colons} colons — expected 1)[/yellow]"
+            self._line(
+                f"  token: [dim]{credentials.mask(token)}[/dim]  "
+                f"[dim]({len(token)} chars)[/dim]{note}{colon_note}"
+            )
         else:
             self._line("  token: [yellow]not set[/yellow]  ([cyan]/telegram login <token>[/cyan])")
         ids = credentials.get_telegram_allowed_ids()
@@ -918,7 +932,57 @@ class HarnessApp(App):
         else:
             self._line("  allowed ids: [yellow]not set[/yellow]  ([cyan]/telegram allow <id>[/cyan])")
         if not running:
-            self._line("usage: [cyan]/telegram start[/cyan] · [cyan]/telegram stop[/cyan]")
+            self._line(
+                "usage: [cyan]/telegram start[/cyan] · "
+                "[cyan]/telegram test[/cyan] (verify token without polling) · "
+                "[cyan]/telegram stop[/cyan]"
+            )
+
+    def _telegram_test(self) -> None:
+        """One-shot getMe call against Telegram — fastest way to verify
+        whether the saved token is the problem, without spinning up the
+        full polling loop."""
+        token = credentials.get_telegram_token()
+        if not token:
+            self._line("[red]no token saved[/red] — [cyan]/telegram login <token>[/cyan] first")
+            return
+        try:
+            import telegram  # noqa: F401
+        except ImportError as e:
+            self._line(f"[red]missing dependency:[/red] {e}")
+            return
+        self._line(f"[dim]testing token {credentials.mask(token)} ({len(token)} chars) against api.telegram.org/getMe …[/dim]")
+        self.run_worker(
+            self._do_telegram_test(token),
+            exclusive=False, group="telegram-test", thread=True,
+        )
+
+    async def _do_telegram_test(self, token: str) -> None:
+        import asyncio
+        try:
+            from telegram import Bot
+            from telegram.error import InvalidToken, NetworkError, TelegramError
+
+            async def call() -> str:
+                bot = Bot(token=token)
+                async with bot:
+                    me = await bot.get_me()
+                return f"[green]✓ token works[/green]   bot=@{me.username}  id={me.id}  name={me.first_name!r}"
+
+            result = asyncio.run(call())
+        except InvalidToken as e:
+            result = (
+                f"[red]✗ Telegram rejected the token[/red]  ({type(e).__name__}: {e})\n"
+                f"   stored value is {len(token)} chars; real BotFather tokens are typically ~46 chars\n"
+                f"   if length is much longer, you likely pasted the token twice or copied surrounding text"
+            )
+        except NetworkError as e:
+            result = f"[red]✗ network error reaching Telegram[/red]  ({type(e).__name__}: {e})"
+        except TelegramError as e:
+            result = f"[red]✗ Telegram error[/red]  ({type(e).__name__}: {e})"
+        except Exception as e:
+            result = f"[red]✗ unexpected error[/red]  ({type(e).__name__}: {e})"
+        self.call_from_thread(self._line, result)
 
     def _telegram_login(self, token: str) -> None:
         if not token:
