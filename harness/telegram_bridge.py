@@ -230,9 +230,29 @@ class TelegramBridge:
         app.add_handler(CommandHandler("auto", self._cmd_auto))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
 
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
+        from telegram.error import InvalidToken, NetworkError
+
+        try:
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True)
+        except InvalidToken:
+            self.on_log(
+                "invalid bot token — Telegram rejected it. "
+                "fix with /telegram login <token> (get a fresh one from @BotFather)."
+            )
+            try:
+                await app.shutdown()
+            except Exception:
+                pass
+            return
+        except NetworkError as e:
+            self.on_log(f"network error talking to Telegram: {e}")
+            try:
+                await app.shutdown()
+            except Exception:
+                pass
+            return
         self.on_log(f"telegram bridge listening · allowed_ids={sorted(self.allowed_ids)}")
         try:
             await self._stop_event.wait()
