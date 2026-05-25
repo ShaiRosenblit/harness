@@ -351,18 +351,19 @@ def apply_overrides(agent: Agent, overrides: dict) -> Agent:
 # Friendly icons for tool_call rendering in the live (compact) view.
 # Unknown tools fall back to a plain bullet — keep this small and stable.
 _TOOL_GLYPH = {
-    "code_exec":          "⚙",
-    "bash":               "$",
-    "spawn":              "↳",
+    "code_exec":          "🐍",
+    "bash":               "🖥️",
+    "spawn":              "🌱",
     "submit":             "✓",
+    "use_skill":          "🧠",
     "web_search":         "🔍",
     "web:search":         "🔍",
     "search":             "🔍",
     "web_fetch":          "🌐",
     "web:fetch":          "🌐",
     "fetch":              "🌐",
-    "read_file":          "📄",
-    "write_file":         "✎",
+    "read_file":          "📖",
+    "write_file":         "✏️",
 }
 
 
@@ -1478,18 +1479,37 @@ class HarnessApp(App):
             return
 
         if t == "model_response":
-            # In chat mode the final reply is printed by _on_chat_reply,
-            # so showing model_response text would duplicate it. In /run
-            # there's no separate reply line, so surface intermediate text.
-            if in_chat:
-                return
             text = (p.get("text") or "").strip()
+            tcs = p.get("tool_calls") or []
+            cites = p.get("citations") or []
+
+            # Implicit web search done by the model surfaces as citations.
+            # There's no tool_call event for it, so render one here so the
+            # user can see search activity actually happened.
+            if cites:
+                self._line(
+                    f"  {seat_prefix}🔍 [b cyan]web search[/b cyan]  "
+                    f"[dim]{len(cites)} source"
+                    f"{'s' if len(cites) != 1 else ''}[/dim]"
+                )
+
             if not text:
                 return
+
+            # In chat mode, text-only model_response IS the final reply —
+            # _on_chat_reply / the submit fold below renders it. Skip here
+            # to avoid duplication. Text alongside tool_calls is narration
+            # ("inner thought"), which is worth showing in both modes.
+            is_inner_thought = bool(tcs)
+            if in_chat and not is_inner_thought:
+                return
+
             if len(text) > 500:
                 text = text[:500].rstrip() + "…"
             for line in text.splitlines():
-                self._line(f"  {seat_prefix}{line}")
+                self._line(
+                    f"  {seat_prefix}[italic #9ca3af]💭 {line}[/italic #9ca3af]"
+                )
             return
 
         if t == "tool_call":
@@ -1500,7 +1520,7 @@ class HarnessApp(App):
                 return
             preview = _tool_arg_preview(tool, p.get("args") or {})
             glyph = _TOOL_GLYPH.get(tool, "·")
-            line = f"  {seat_prefix}[dim]{glyph}[/dim] [b cyan]{tool}[/b cyan]"
+            line = f"  {seat_prefix}{glyph} [b cyan]{tool}[/b cyan]"
             if preview:
                 line += f"  [dim]{preview}[/dim]"
             self._line(line)
@@ -1527,6 +1547,11 @@ class HarnessApp(App):
             return
 
         if t == "submit":
+            # In chat mode the submit text is exactly what _on_chat_reply
+            # prints as the agent message — showing it here just doubles
+            # the same content with a "✓ submit" label.
+            if in_chat:
+                return
             result = (p.get("result") or "").strip()
             if len(result) > 200:
                 result = result[:200].rstrip() + "…"
