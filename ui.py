@@ -565,11 +565,16 @@ class HarnessSuggester(Suggester):
 CSS = """
 Screen { layout: vertical; }
 #output { height: 1fr; padding: 0 1; }
-#status { dock: bottom; height: 1; padding: 0 1; color: $text-muted; }
+/* Status bar flows in the normal vertical layout. Without an explicit
+   height it collapses to its content (so it takes 0 rows when idle and
+   1 row when active). Docking it would put it on top of the prompt /
+   Footer at the same y; flow layout keeps it visible just above the
+   prompt. */
+#status         { height: auto; padding: 0 1; color: $text-muted; }
 #status.busy    { color: $accent; }
-#status.stopped { color: $error; text-style: bold; }
+#status.stopped { color: $error; text-style: bold; background: $error 10%; }
 #status.idle    { color: $text-muted; }
-#prompt { dock: bottom; }
+#prompt         { dock: bottom; }
 """
 
 # Animation frames for the "agent is doing something" spinner. Braille
