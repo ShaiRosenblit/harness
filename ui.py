@@ -154,6 +154,7 @@ COMMANDS = (
     "chat", "end", "run",
     "prompts", "prompt", "p",
     "approve", "deny", "approvals", "auto",
+    "telegram",
     "clear", "quit", "exit",
 )
 
@@ -182,6 +183,9 @@ HELP_TEXT = """\
   [cyan]/deny[/cyan] [dim]<id>[/dim]       deny a pending risky tool call
   [cyan]/approvals[/cyan]           list pending + resolved approvals for this run
   [cyan]/auto[/cyan] [dim]on|off[/dim]      session-wide auto-approve (risky tools run without prompting)
+  [cyan]/telegram[/cyan] [dim]status|start|stop[/dim]   mirror the UI on Telegram
+  [cyan]/telegram login[/cyan] [dim]<token>[/dim]      save bot token (from @BotFather)
+  [cyan]/telegram allow[/cyan] [dim]<id>[,<id>...][/dim]   set allowed numeric chat ids ([dim]-[/dim] to clear)
   [cyan]/clear[/cyan] · [cyan]/help[/cyan] · [cyan]/quit[/cyan]
 
 [b]keyboard[/b]
@@ -567,6 +571,7 @@ class HarnessApp(App):
         # Session-wide auto-approve toggle. Off by default; opt in with
         # `/auto on` or a per-run `--auto-approve` flag.
         self._auto_approve: bool = False
+        self._telegram = None  # harness.telegram_bridge.TelegramBridge
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -689,6 +694,8 @@ class HarnessApp(App):
             self._line("chat: [dim]inactive[/dim]")
         auto_state = "[red]ON[/red]" if self._auto_approve else "[dim]off[/dim]"
         self._line(f"auto-approve (session default): {auto_state}")
+        tg_state = "[green]running[/green]" if (self._telegram and self._telegram.is_running()) else "[dim]stopped[/dim]"
+        self._line(f"telegram bridge: {tg_state}")
         self._line(f"runs dir: [dim]{RUNS_DIR}[/dim]")
         self._line(f"credentials: [dim]{credentials.CREDENTIALS_PATH}[/dim]")
 
@@ -835,6 +842,152 @@ class HarnessApp(App):
             self._line("usage: [cyan]/auto on[/cyan]  ·  [cyan]/auto off[/cyan]")
         else:
             self._line(f"[red]unknown:[/red] /auto {rest!r} — try [cyan]/auto on|off[/cyan]")
+
+    def _cmd_telegram(self, rest: str) -> None:
+        """Manage the Telegram bridge. Subcommands:
+          status                       (default) running + saved config
+          start | stop                 run / shut down the bridge
+          login <token>                save bot token (~/.config/harness/credentials.json)
+          logout                       clear saved token
+          allow <id>[,<id>...] | -     set the numeric chat-id allowlist (`-` clears)
+        Env vars TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOWED_CHAT_IDS still win
+        if set. The bridge runs in a background thread with its own
+        asyncio loop; each authorized Telegram chat gets its own
+        ChatSession, independent of the textual UI's local chat."""
+        parts = rest.strip().split(None, 1)
+        sub = (parts[0].lower() if parts else "status")
+        arg = (parts[1].strip() if len(parts) > 1 else "")
+
+        if sub == "status":
+            self._telegram_status()
+            return
+        if sub == "login":
+            self._telegram_login(arg)
+            return
+        if sub == "logout":
+            credentials.clear_telegram_token()
+            self._line("[yellow]telegram token cleared[/yellow]")
+            return
+        if sub == "allow":
+            self._telegram_allow(arg)
+            return
+        if sub == "stop":
+            if not (self._telegram and self._telegram.is_running()):
+                self._line("[dim]telegram bridge not running[/dim]")
+                return
+            self._telegram.stop()
+            self._telegram = None
+            self._line("[yellow]telegram bridge stopped[/yellow]")
+            return
+        if sub != "start":
+            self._line(f"[red]unknown:[/red] /telegram {sub!r} — try start|stop|status|login|logout|allow")
+            return
+
+        if self._telegram and self._telegram.is_running():
+            self._line("[yellow]telegram bridge already running[/yellow]")
+            return
+        if not credentials.get_api_key():
+            self._line("[red]bridge needs an OpenRouter key.[/red]  use [cyan]/login <key>[/cyan] first.")
+            return
+        credentials.inject_env()
+        try:
+            from harness import telegram_bridge
+        except ImportError as e:
+            self._line(f"[red]missing dependency:[/red] {e}")
+            self._line("install with: [cyan]pip install python-telegram-bot>=20[/cyan]")
+            return
+        try:
+            token, allowed = telegram_bridge.load_config()
+        except ValueError as e:
+            self._line(f"[red]{e}[/red]")
+            return
+
+        def _on_log(msg: str) -> None:
+            # Marshal back to the textual thread.
+            self.call_from_thread(self._line, f"[magenta]telegram[/magenta] · {msg}")
+
+        bridge = telegram_bridge.TelegramBridge(
+            token=token,
+            allowed_ids=allowed,
+            runs_dir=RUNS_DIR,
+            default_chat_agent=DEFAULT_CHAT_AGENT,
+            load_agent=load_agent,
+            list_agents=list_agents,
+            parse_overrides=parse_overrides,
+            apply_overrides=apply_overrides,
+            on_log=_on_log,
+        )
+        try:
+            bridge.start_in_thread()
+        except Exception as e:
+            self._line(f"[red]failed to start bridge:[/red] {e}")
+            return
+        self._telegram = bridge
+        self._line(
+            f"[green]telegram bridge starting[/green]   allowed_ids={sorted(allowed)}"
+        )
+
+    def _telegram_status(self) -> None:
+        running = self._telegram and self._telegram.is_running()
+        state = "[green]running[/green]" if running else "[dim]stopped[/dim]"
+        self._line(f"telegram: {state}")
+        token = credentials.get_telegram_token()
+        if token:
+            self._line(f"  token: [dim]{credentials.mask(token)}[/dim]")
+        else:
+            self._line("  token: [yellow]not set[/yellow]  ([cyan]/telegram login <token>[/cyan])")
+        ids = credentials.get_telegram_allowed_ids()
+        if ids:
+            self._line(f"  allowed ids: [dim]{sorted(ids)}[/dim]")
+        else:
+            self._line("  allowed ids: [yellow]not set[/yellow]  ([cyan]/telegram allow <id>[/cyan])")
+        if not running:
+            self._line("usage: [cyan]/telegram start[/cyan] · [cyan]/telegram stop[/cyan]")
+
+    def _telegram_login(self, token: str) -> None:
+        if not token:
+            self._line("usage: [cyan]/telegram login <bot-token>[/cyan]   (get one from @BotFather)")
+            return
+        if len(token) < 20 or ":" not in token:
+            self._line("[red]that doesn't look like a real bot token (expected `<id>:<secret>`)[/red]")
+            return
+        try:
+            path = credentials.save_telegram_token(token)
+        except OSError as e:
+            self._line(f"[red]failed to save:[/red] {e}")
+            return
+        self._line(f"[green]✓ telegram token saved[/green]   token=[dim]{credentials.mask(token)}[/dim]")
+        self._line(f"[dim]saved to {path}[/dim]")
+        if not credentials.get_telegram_allowed_ids():
+            self._line(
+                "[dim]next:[/dim] [cyan]/telegram allow <your-telegram-id>[/cyan]  "
+                "[dim](DM @userinfobot to get it)[/dim]"
+            )
+
+    def _telegram_allow(self, arg: str) -> None:
+        if not arg:
+            ids = credentials.get_telegram_allowed_ids()
+            self._line(f"allowed ids: {sorted(ids) if ids else '(none)'}")
+            self._line("usage: [cyan]/telegram allow <id>[,<id>...][/cyan]   (or [cyan]-[/cyan] to clear)")
+            return
+        if arg.strip() == "-":
+            credentials.clear_telegram_allowed_ids()
+            self._line("[yellow]allowed ids cleared[/yellow]")
+            return
+        try:
+            ids = [int(t.strip()) for t in arg.split(",") if t.strip()]
+        except ValueError:
+            self._line(f"[red]ids must be integers:[/red] {arg!r}")
+            return
+        if not ids:
+            self._line("[red]no ids parsed[/red]")
+            return
+        try:
+            credentials.save_telegram_allowed_ids(ids)
+        except OSError as e:
+            self._line(f"[red]failed to save:[/red] {e}")
+            return
+        self._line(f"[green]✓ allowed ids saved[/green]: {sorted(ids)}")
 
     def _cmd_approve(self, rest: str) -> None:
         self._resolve_approval(rest.strip(), "approve")
