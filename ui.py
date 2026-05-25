@@ -63,6 +63,9 @@ class SuggestingInput(Input):
                 show=False, priority=True),
     ]
 
+    # Defense window for double-fire pastes (see _on_paste below).
+    _PASTE_DEDUP_WINDOW_S = 0.5
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._pastes: dict[int, str] = {}
@@ -72,12 +75,32 @@ class SuggestingInput(Input):
         self._history_idx: int = 0
         self._draft_value: str = ""
         self._draft_pastes: dict[int, str] = {}
+        # Last paste text + monotonic timestamp, for dedup.
+        self._last_paste_text: str = ""
+        self._last_paste_at: float = 0.0
 
     def _on_paste(self, event: events.Paste) -> None:
         text = event.text or ""
         if not text:
             event.stop()
             return
+        # Defense against terminals, multiplexers (tmux/screen), or
+        # clipboard managers that silently fire the same paste twice
+        # within milliseconds. Textual's bracketed-paste parser itself
+        # emits one Paste per ESC[200~…ESC[201~ pair (see
+        # textual/_xterm_parser.py), so a repeat we see here is coming
+        # from below us, not from Textual. Treat any identical paste
+        # within _PASTE_DEDUP_WINDOW_S as a duplicate and drop it.
+        import time
+        now = time.monotonic()
+        if (
+            text == self._last_paste_text
+            and (now - self._last_paste_at) < self._PASTE_DEDUP_WINDOW_S
+        ):
+            event.stop()
+            return
+        self._last_paste_text = text
+        self._last_paste_at = now
         if "\n" in text:
             paste_id = len(self._pastes) + 1
             self._pastes[paste_id] = text
