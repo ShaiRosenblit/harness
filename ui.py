@@ -948,19 +948,15 @@ class HarnessApp(App):
         if not token:
             self._line("usage: [cyan]/telegram login <bot-token>[/cyan]   (get one from @BotFather)")
             return
-        # Real Telegram bot tokens look like `<digits>:<35+ url-safe chars>`.
-        # Reject anything that isn't shaped that way before hitting the API.
-        import re
+        # Don't pre-validate the shape. Token formats vary (test-server
+        # tokens, newer issuances, …) and Telegram itself is the source
+        # of truth at /telegram start. We just strip whitespace and warn
+        # on really-obviously-wrong inputs.
         cleaned = "".join(token.split())
-        m = re.fullmatch(r"\d+:[A-Za-z0-9_-]{30,}", cleaned)
-        if not m:
+        if len(cleaned) < 20 or ":" not in cleaned:
             self._line(
                 f"[red]that doesn't look like a real bot token[/red] "
-                f"(got {len(cleaned)} chars, expected `<id>:<35+ chars>`)"
-            )
-            self._line(
-                "[dim]from @BotFather, look for the line under "
-                "[i]Use this token to access the HTTP API:[/i][/dim]"
+                f"(got {len(cleaned)} chars, expected `<id>:<secret>`)"
             )
             return
         try:
