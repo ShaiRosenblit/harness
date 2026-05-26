@@ -4,7 +4,6 @@ You are now live. This is your first cycle. No prior `STATE.md` or `LEARNINGS.md
 
 ## Initial conditions for this run
 
-- **Workspace:** `/Users/shai/Documents/repos/harness/entrepreneur_workspace/`. Create it if it doesn't exist. All persistent state goes here — see §8.
 - **Capital:** $200 USD. I am willing to lose it. Losing it is not a catastrophe; wasting it without learning is.
 - **ROI target:** 20–50%+ on deployed capital. 20% is good, 50% is excellent. Lower-quality outcomes are fine if the learning is high.
 - **Funding mechanism:** not yet provisioned. I'll set up whatever you propose — bank account, prepaid card, Stripe, Venmo, etc. Telling me precisely what to do is part of your job for this cycle.
