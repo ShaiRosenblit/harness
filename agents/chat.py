@@ -26,7 +26,9 @@ PROMPT = (
     "one matches the task.\n"
     "  - spawn — delegate a focused sub-task to a fresh sub-agent that "
     "returns its submitted result to you. Useful for parallel research "
-    "or to isolate long/expensive work from your main context.\n"
+    "or to isolate long/expensive work from your main context. Runs on "
+    "your model by default, or a different one via the `model` arg.\n"
+    "  - list_models — see which model ids you can spawn a sub-agent on.\n"
     "  - submit — send your reply to the user. Always end a turn by "
     "calling submit() with the final reply text.\n"
     "Reply concisely. Reach for the right tool: code_exec for Python, "
@@ -38,7 +40,7 @@ PROMPT = (
 AGENT = Agent(
     model="moonshotai/kimi-k2.6",
     system_prompt=PROMPT,
-    tools=("code_exec", "bash", "submit", "spawn", "use_skill"),
+    tools=("code_exec", "bash", "submit", "spawn", "use_skill", "list_models"),
     max_turns=30,
     max_depth=10,
     max_children=3,

@@ -33,9 +33,10 @@ class ToolSpec:
 @dataclass
 class Seat:
     """One running agent in the forest. Children spawned from this seat
-    inherit the same config fields (model, system_prompt, tools, web,
-    max_turns, max_depth, max_children, tool_timeout_s, web_*) at depth+1.
-    Recursion is bounded by max_depth.
+    inherit the same config fields (system_prompt, tools, web, max_turns,
+    max_depth, max_children, tool_timeout_s, web_*) at depth+1. The child
+    runs on the parent's model by default, but spawn may override it with a
+    different model. Recursion is bounded by max_depth.
 
     Token/cost counters are observability only — not enforced.
     """
@@ -81,10 +82,11 @@ class Agent:
     """An agent config — what model, what prompt, what capabilities, what
     structural limits. The harness mints a seat from this for a run.
 
-    When a seat spawns, the child inherits this exact config (same model,
-    same prompt, same tools, same web grants) at depth+1. There is no
-    separate child template — children are copies of the parent. Recursion
-    is bounded by max_depth.
+    When a seat spawns, the child inherits this config (same prompt, same
+    tools, same web grants) at depth+1, running on the parent's model unless
+    spawn overrides it with a different model. There is no separate child
+    template — children are copies of the parent. Recursion is bounded by
+    max_depth.
     """
     model: str
     system_prompt: str

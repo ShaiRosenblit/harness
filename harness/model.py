@@ -10,6 +10,22 @@ from .log import Log
 from .types import Seat, ToolSpec
 
 
+# ---- Available models ------------------------------------------------------
+# Curated set of OpenRouter model ids the harness recommends. There is no
+# upstream registry in this repo — agents reference model ids as plain
+# strings — so this is the canonical "available set" the list_models tool
+# surfaces. Any valid OpenRouter id still works when passed explicitly; this
+# list is guidance, not a hard allow-list. Each entry is (id, one-line label).
+AVAILABLE_MODELS: List[tuple] = [
+    ("moonshotai/kimi-k2.6", "Moonshot Kimi K2.6 — default; strong, low-cost generalist"),
+    ("anthropic/claude-sonnet-4.6", "Anthropic Claude Sonnet 4.6 — capable, balanced"),
+    ("anthropic/claude-haiku-4-5", "Anthropic Claude Haiku 4.5 — fast, cheap"),
+    ("deepseek/deepseek-chat", "DeepSeek Chat — capable open-weight generalist"),
+    ("openai/gpt-5.1", "OpenAI GPT-5.1 — strong reasoning"),
+    ("google/gemini-2.5-pro", "Google Gemini 2.5 Pro — long context, multimodal"),
+]
+
+
 def _harness_preamble(seat: Seat) -> str:
     """Real-time context the model can rely on each turn:
        - today's date / timestamp / timezone

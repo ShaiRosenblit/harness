@@ -344,8 +344,10 @@ def _h_submit(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
 def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
     """Spawn a same-kind child: a copy of the parent's seat config at
     depth+1, with a fresh history starting from `prompt`. Bounded by
-    `max_depth` (recursion) and `max_children` (breadth per seat)."""
+    `max_depth` (recursion) and `max_children` (breadth per seat). The child
+    runs on the parent's model unless `model` overrides it."""
     prompt = args.get("prompt", "")
+    child_model = (args.get("model") or "").strip() or seat.model
 
     new_depth = seat.depth + 1
     if new_depth > seat.max_depth:
@@ -374,13 +376,13 @@ def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
         child_id = f"{seat.id}.{seat.child_count}"
         ctx.live_seats.add(child_id)
 
-    # Mint a child with the parent's exact config (capability attenuation
-    # is automatic — child == parent).
+    # Mint a child with the parent's config (capability attenuation is
+    # automatic — child == parent), optionally on a different model.
     child = Seat(
         id=child_id,
         parent_id=seat.id,
         depth=new_depth,
-        model=seat.model,
+        model=child_model,
         system_prompt=seat.system_prompt,
         tools=seat.tools,
         web=seat.web,
@@ -401,6 +403,7 @@ def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
             "child_id": child_id,
             "prompt": prompt,
             "depth": new_depth,
+            "model": child_model,
         },
     )
 
@@ -420,6 +423,23 @@ def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
             "child_id": child_id,
             "child_halt_reason": child.halt_reason,
         },
+    )
+
+
+def _h_list_models(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
+    """Return the curated set of OpenRouter model ids available to spawn
+    sub-agents on. Any valid OpenRouter id works when passed to spawn; this
+    list is guidance, not a hard allow-list."""
+    from .model import AVAILABLE_MODELS
+    lines = "\n".join(f"  {mid} — {label}" for mid, label in AVAILABLE_MODELS)
+    content = (
+        f"Available models (pass one as spawn's `model` arg):\n{lines}\n"
+        f"Your own model is {seat.model}. Any valid OpenRouter id also works."
+    )
+    return ToolResult(
+        ok=True,
+        content=content,
+        meta={"models": [mid for mid, _ in AVAILABLE_MODELS]},
     )
 
 
@@ -496,19 +516,45 @@ def register_builtins() -> None:
             name="spawn",
             description=(
                 "Spawn a sub-agent to handle a focused sub-task. The child "
-                "is a fresh copy of you (same model, prompt, tools, limits) "
-                "at depth+1, running its own driver loop from a fresh "
-                "history starting with `prompt`. Blocks until the child "
+                "inherits your prompt, tools, and limits at depth+1, running "
+                "its own driver loop from a fresh history starting with "
+                "`prompt`. It runs on your model by default, or on a "
+                "different model if you pass `model`. Blocks until the child "
                 "submits, then returns its submitted result to you. "
                 "Bounded by your max_depth (recursion) and max_children "
                 "(siblings per turn)."
             ),
             parameters={
                 "type": "object",
-                "properties": {"prompt": {"type": "string"}},
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "model": {
+                        "type": "string",
+                        "description": (
+                            "Optional. OpenRouter model id for the sub-agent "
+                            "(e.g. 'anthropic/claude-sonnet-4.6'). Defaults to "
+                            "your own model if omitted. Call the list_models "
+                            "tool to see available options."
+                        ),
+                    },
+                },
                 "required": ["prompt"],
             },
             handler=_h_spawn,
+        )
+    )
+    register(
+        ToolSpec(
+            name="list_models",
+            description=(
+                "List the model ids available for you to use (e.g. when "
+                "spawning a sub-agent with a specific model)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {},
+            },
+            handler=_h_list_models,
         )
     )
 

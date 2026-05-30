@@ -113,7 +113,7 @@ Calling `submit()` halts your seat until the Principal replies. Make every submi
 AGENT = Agent(
     model="moonshotai/kimi-k2.6",
     system_prompt=PROMPT,
-    tools=("code_exec", "bash", "submit", "spawn", "use_skill"),
+    tools=("code_exec", "bash", "submit", "spawn", "use_skill", "list_models"),
     max_turns=60,
     max_depth=3,
     max_children=4,
