@@ -676,6 +676,15 @@ Screen { layout: vertical; }
 # spinner is one cell wide and renders well in monospace terminals.
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
+# Recessive palette for the "activity" stream — the agent's thinking and
+# tool steps. The actual conversation (user messages + the agent's answer)
+# renders in the terminal's normal foreground and at a shallower indent, so
+# it stays the most prominent thing on screen; activity is dimmer AND
+# indented one level deeper so the eye reads it as subordinate detail.
+_ACT = "#6b7280"       # grey-500: activity labels, glyphs, gutters
+_ACT_TEXT = "#9ca3af"  # grey-400: code / output content (a touch brighter, still legible)
+_ACT_IND = "    "      # activity indent (the conversation answer sits at 2 spaces)
+
 
 class HarnessApp(App):
     CSS = CSS
@@ -1758,9 +1767,9 @@ class HarnessApp(App):
             # user can see search activity actually happened.
             if cites:
                 self._line(
-                    f"  {seat_prefix}🔍 [b cyan]web search[/b cyan]  "
-                    f"[dim]{len(cites)} source"
-                    f"{'s' if len(cites) != 1 else ''}[/dim]"
+                    f"{_ACT_IND}{seat_prefix}[{_ACT}]🔍 web search · "
+                    f"{len(cites)} source"
+                    f"{'s' if len(cites) != 1 else ''}[/{_ACT}]"
                 )
 
             if not text:
@@ -1778,7 +1787,7 @@ class HarnessApp(App):
                 text = text[:500].rstrip() + "…"
             for line in text.splitlines():
                 self._line(
-                    f"  {seat_prefix}[italic #9ca3af]💭 {escape(line)}[/italic #9ca3af]"
+                    f"{_ACT_IND}{seat_prefix}[italic {_ACT}]💭 {escape(line)}[/italic {_ACT}]"
                 )
             return
 
@@ -1793,15 +1802,15 @@ class HarnessApp(App):
                 return
             preview = _tool_arg_preview(tool, args)
             glyph = _TOOL_GLYPH.get(tool, "·")
-            line = f"  {seat_prefix}{glyph} [b cyan]{tool}[/b cyan]"
+            line = f"{_ACT_IND}{seat_prefix}[{_ACT}]{glyph} {tool}[/{_ACT}]"
             if preview:
-                line += f"  [dim]{escape(preview)}[/dim]"
+                line += f"  [{_ACT}]{escape(preview)}[/{_ACT}]"
             self._line(line)
             # Full multi-line input (the whole function / command) folded
             # under the header with a gutter, so the user sees ALL of it
             # rather than just the first line.
             for bl in _clip_block(_tool_input_lines(tool, args), _MAX_INPUT_LINES):
-                self._line(f"  {seat_prefix}[dim]│[/dim] [#9ca3af]{bl}[/#9ca3af]")
+                self._line(f"{_ACT_IND}{seat_prefix}[{_ACT}]│[/{_ACT}] [{_ACT_TEXT}]{bl}[/{_ACT_TEXT}]")
             if self._is_running:
                 self._set_status("busy", f"running {glyph} {tool}…")
             return
@@ -1821,15 +1830,15 @@ class HarnessApp(App):
                 body = content.splitlines() if content else []
                 if len(body) == 1 and len(body[0]) <= 100:
                     self._line(
-                        f"  {seat_prefix}[green]✓[/green] "
-                        f"[#9ca3af]{escape(body[0])}[/#9ca3af]"
+                        f"{_ACT_IND}{seat_prefix}[{_ACT}]✓[/{_ACT}] "
+                        f"[{_ACT_TEXT}]{escape(body[0])}[/{_ACT_TEXT}]"
                     )
                 elif body:
-                    self._line(f"  {seat_prefix}[green]✓[/green] [dim]{tool} result[/dim]")
+                    self._line(f"{_ACT_IND}{seat_prefix}[{_ACT}]✓ {tool} result[/{_ACT}]")
                     for bl in _clip_block(body, _MAX_RESULT_LINES):
-                        self._line(f"  {seat_prefix}[dim]│[/dim] [#9ca3af]{bl}[/#9ca3af]")
+                        self._line(f"{_ACT_IND}{seat_prefix}[{_ACT}]│[/{_ACT}] [{_ACT_TEXT}]{bl}[/{_ACT_TEXT}]")
                 else:
-                    self._line(f"  {seat_prefix}[green]✓[/green] [dim]{tool}[/dim]")
+                    self._line(f"{_ACT_IND}{seat_prefix}[{_ACT}]✓ {tool}[/{_ACT}]")
                 # Once a tool finishes, the model gets the result and starts
                 # thinking about the next move — keep the spinner honest.
                 if self._is_running:
@@ -1837,8 +1846,8 @@ class HarnessApp(App):
                 return
             err = (p.get("error") or "failed").splitlines()[0][:120]
             self._line(
-                f"  {seat_prefix}[red]✗[/red] [b]{tool}[/b] "
-                f"[dim]{escape(err)}[/dim]"
+                f"{_ACT_IND}{seat_prefix}[red]✗[/red] [{_ACT_TEXT}]{tool}[/{_ACT_TEXT}] "
+                f"[red dim]{escape(err)}[/red dim]"
             )
             if self._is_running:
                 self._set_status("busy", f"recovering from {tool} error…")
@@ -1848,8 +1857,7 @@ class HarnessApp(App):
             child = p.get("child_id")
             depth = p.get("depth")
             self._line(
-                f"  {seat_prefix}[magenta]↳[/magenta] spawn "
-                f"[cyan]{child}[/cyan] [dim]depth={depth}[/dim]"
+                f"{_ACT_IND}{seat_prefix}[{_ACT}]↳ spawn {child} · depth={depth}[/{_ACT}]"
             )
             return
 
@@ -1859,13 +1867,16 @@ class HarnessApp(App):
             # the same content with a "✓ submit" label.
             if in_chat:
                 return
+            # Run-mode submit is the agent's actual answer — render it at
+            # conversation prominence (normal text), not as a dim step.
             result = (p.get("result") or "").strip()
-            if len(result) > 200:
-                result = result[:200].rstrip() + "…"
-            self._line(
-                f"  {seat_prefix}[green]✓ submit[/green]"
-                + (f"  [italic dim]{result}[/italic dim]" if result else "")
-            )
+            self._line("")
+            self._line(f"  {seat_prefix}[b green]✓ submit[/b green]")
+            if result:
+                if len(result) > 500:
+                    result = result[:500].rstrip() + "…"
+                for line in result.splitlines():
+                    self._line(f"  {escape(line)}")
             return
 
         if t == "halt":
@@ -1879,7 +1890,7 @@ class HarnessApp(App):
             # can't miss that the agent gave up.
             self._line("")
             self._line(
-                f"  {seat_prefix}[b white on red] ■ STOPPED [/]  "
+                f"{_ACT_IND}{seat_prefix}[b white on red] ■ STOPPED [/]  "
                 f"[red]{reason}[/red]"
             )
             if sid and sid == "s0" or not sid:
@@ -1892,13 +1903,13 @@ class HarnessApp(App):
             reason = p.get("reason") or ""
             tool = p.get("tool") or ""
             self._line(
-                f"  {seat_prefix}[yellow]denied[/yellow] "
-                f"[dim]{tool}: {reason}[/dim]"
+                f"{_ACT_IND}{seat_prefix}[yellow]denied[/yellow] "
+                f"[yellow dim]{tool}: {reason}[/yellow dim]"
             )
             return
 
         # Fallback for any future event types — keep it quiet but visible.
-        self._line(f"  {seat_prefix}[dim]{t}[/dim]")
+        self._line(f"{_ACT_IND}{seat_prefix}[{_ACT}]{t}[/{_ACT}]")
 
     # ---- misc ----------------------------------------------------------- #
 
