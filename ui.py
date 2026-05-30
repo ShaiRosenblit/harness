@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """Interactive shell for the harness.
 
-Single output area on top, command prompt at the bottom. Slash commands
-do everything; plain text without a `/` is sent as a chat message.
+The conversation flows into your terminal's normal scrollback, with a live
+input prompt pinned at the bottom — like a regular shell (or Claude Code).
+The app deliberately does NOT take over the screen or capture the mouse, so
+mouse-wheel / trackpad scrolling and drag-to-select copy/paste all work
+exactly the way they do in your terminal, with no modifier keys.
+
+Slash commands do everything; plain text without a `/` is sent as a chat
+message.
 
 First launch:  /login <openrouter-api-key>
 After login:   /run <agent> <message>    one-shot task
@@ -11,8 +17,8 @@ After login:   /run <agent> <message>    one-shot task
 """
 from __future__ import annotations
 
+import asyncio
 import json
-import re
 import shlex
 import shutil
 import sys
@@ -31,203 +37,16 @@ from harness.forest import run_forest  # noqa: E402
 from harness.session import start_chat  # noqa: E402
 from harness.types import Agent  # noqa: E402
 
-from textual.app import App, ComposeResult  # noqa: E402
-from textual.binding import Binding  # noqa: E402
-from textual.suggester import Suggester  # noqa: E402
-from textual import events  # noqa: E402
-from textual.widgets import Footer, Header, Input, RichLog, Static  # noqa: E402
+from rich.console import Console  # noqa: E402
 from rich.markup import escape  # noqa: E402
 
-
-_PASTE_MARKER_RE = re.compile(r"\[Pasted #(\d+) \+(\d+) lines\]")
-
-
-class SuggestingInput(Input):
-    """Input with shell-like UX:
-       - Tab accepts the suggester's ghost-text suggestion.
-       - ↑ / ↓ navigate command history (most-recent first on first ↑).
-       - Multi-line pastes are stashed under a numbered `[Pasted #N +K lines]`
-         marker so the user can still edit around them; on submit the marker
-         expands back to the real text.
-
-    History preserves paste markers and their content together — if the
-    user re-submits a recalled line with a paste marker in it, the marker
-    still expands correctly.
-    """
-
-    BINDINGS = [
-        Binding("tab",  "cursor_right", "accept suggestion",
-                show=False, priority=True),
-        # ↑/↓ are dual-purpose: history nav when there is something to
-        # navigate, otherwise fall through to the App's scroll action so
-        # the mouse wheel (which alt-scroll-mode translates to ↑/↓) can
-        # scroll the conversation log. Ctrl+P / Ctrl+N always do history.
-        Binding("up",     "history_prev",       "↑ history", show=False, priority=True),
-        Binding("down",   "history_next",       "↓ history", show=False, priority=True),
-        Binding("ctrl+p", "force_history_prev", show=False, priority=True),
-        Binding("ctrl+n", "force_history_next", show=False, priority=True),
-    ]
-
-    # Defense window for double-fire pastes (see _on_paste below).
-    _PASTE_DEDUP_WINDOW_S = 0.5
-    # Below this length we won't collapse "ABCABC" → "ABC" — too risky
-    # to mistake a legitimate short repeating paste for a terminal-doubled
-    # one. Empirically, real-world doubled pastes are token-length or
-    # longer (a Telegram bot token is 46 chars), so 10 is a safe floor.
-    _PASTE_HALVES_DEDUP_MIN_LEN = 10
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._pastes: dict[int, str] = {}
-        # Command history. Each entry is (marker-form text, paste dict).
-        # _history_idx == len(history) means "current input" (live draft).
-        self._history: list[tuple[str, dict[int, str]]] = []
-        self._history_idx: int = 0
-        self._draft_value: str = ""
-        self._draft_pastes: dict[int, str] = {}
-        # Last paste text + monotonic timestamp, for dedup.
-        self._last_paste_text: str = ""
-        self._last_paste_at: float = 0.0
-
-    def _on_paste(self, event: events.Paste) -> None:
-        # Textual dispatches _on_paste through the *entire* MRO (see
-        # textual/message_pump.py:_get_dispatch_methods — it iterates
-        # cls.__mro__ and yields every matching method). event.stop()
-        # only halts bubbling, not parent-class dispatch. Without
-        # prevent_default(), Input._on_paste also runs and inserts
-        # event.text.splitlines()[0] on top of whatever we inserted —
-        # which is why a single paste of "abc" produced "abcabc". Call
-        # prevent_default() up front so the parent handler is skipped.
-        event.prevent_default()
-        text = event.text or ""
-        if not text:
-            event.stop()
-            return
-        # Defense against terminals, multiplexers (tmux/screen), or
-        # clipboard managers that silently fire the same paste twice
-        # within milliseconds. Textual's bracketed-paste parser itself
-        # emits one Paste per ESC[200~…ESC[201~ pair (see
-        # textual/_xterm_parser.py), so a repeat we see here is coming
-        # from below us, not from Textual. Treat any identical paste
-        # within _PASTE_DEDUP_WINDOW_S as a duplicate and drop it.
-        import time
-        now = time.monotonic()
-        if (
-            text == self._last_paste_text
-            and (now - self._last_paste_at) < self._PASTE_DEDUP_WINDOW_S
-        ):
-            event.stop()
-            return
-        self._last_paste_text = text
-        self._last_paste_at = now
-        # Defense against the other doubling mode: a single Paste event
-        # whose payload is already concatenated with itself (some terminals
-        # / clipboard managers do this inside one bracketed-paste pair, so
-        # the rapid-fire dedup above never sees a second event). If text
-        # is long enough that two-halves-identical can't be a coincidence,
-        # collapse to the first half and tell the user we did.
-        n = len(text)
-        if n >= self._PASTE_HALVES_DEDUP_MIN_LEN and n % 2 == 0 \
-                and text[: n // 2] == text[n // 2:]:
-            text = text[: n // 2]
-            try:
-                app = self.app
-                if app is not None and hasattr(app, "_line"):
-                    app._line(
-                        f"[yellow]⚠ paste looked doubled "
-                        f"({n} → {len(text)} chars); kept the first half[/yellow]"
-                    )
-            except Exception:
-                pass
-        if "\n" in text:
-            paste_id = len(self._pastes) + 1
-            self._pastes[paste_id] = text
-            line_count = text.count("\n") + 1
-            insert = f"[Pasted #{paste_id} +{line_count - 1} lines]"
-        else:
-            insert = text
-        selection = self.selection
-        if selection.is_empty:
-            self.insert_text_at_cursor(insert)
-        else:
-            self.replace(insert, *selection)
-        event.stop()
-
-    def consume(self) -> str:
-        """Return the current value with paste markers expanded back to
-        their full text, push the line into history, and reset the input."""
-        def sub(m: "re.Match[str]") -> str:
-            return self._pastes.get(int(m.group(1)), m.group(0))
-        expanded = _PASTE_MARKER_RE.sub(sub, self.value)
-        # Save the *marker-form* line + its paste dict so navigating back
-        # to it later still resolves correctly.
-        if self.value and (not self._history or self._history[-1][0] != self.value):
-            self._history.append((self.value, dict(self._pastes)))
-        self._history_idx = len(self._history)
-        self._draft_value = ""
-        self._draft_pastes = {}
-        self.value = ""
-        self._pastes.clear()
-        return expanded
-
-    # ---- history navigation ------------------------------------------- #
-    # When the input is empty and we are NOT already navigating history,
-    # ↑/↓ defer to the App's scroll-the-log actions instead. That keeps
-    # the mouse wheel (which terminal alt-scroll-mode translates into ↑/↓
-    # keystrokes) usable for reading back through a long conversation.
-    # Ctrl+P / Ctrl+N still force history nav regardless of state.
-
-    def _scroll_fallthrough(self) -> bool:
-        return not self.value and self._history_idx == len(self._history)
-
-    def _app_scroll(self, action: str) -> None:
-        try:
-            handler = getattr(self.app, action, None)
-            if callable(handler):
-                handler()
-        except Exception:
-            pass
-
-    def action_history_prev(self) -> None:
-        if self._scroll_fallthrough():
-            self._app_scroll("action_scroll_one_up")
-            return
-        self.action_force_history_prev()
-
-    def action_history_next(self) -> None:
-        if self._scroll_fallthrough():
-            self._app_scroll("action_scroll_one_down")
-            return
-        self.action_force_history_next()
-
-    def action_force_history_prev(self) -> None:
-        if not self._history:
-            return
-        if self._history_idx == len(self._history):
-            # Snapshot the in-progress draft so ↓-back-to-now restores it.
-            self._draft_value = self.value
-            self._draft_pastes = dict(self._pastes)
-        if self._history_idx > 0:
-            self._history_idx -= 1
-            text, pastes = self._history[self._history_idx]
-            self.value = text
-            self._pastes = dict(pastes)
-            self.cursor_position = len(self.value)
-
-    def action_force_history_next(self) -> None:
-        if not self._history:
-            return
-        if self._history_idx < len(self._history):
-            self._history_idx += 1
-            if self._history_idx == len(self._history):
-                # Back at "now" — restore the live draft.
-                self.value = self._draft_value
-                self._pastes = dict(self._draft_pastes)
-            else:
-                text, pastes = self._history[self._history_idx]
-                self.value = text
-                self._pastes = dict(pastes)
-            self.cursor_position = len(self.value)
+from prompt_toolkit import HTML, PromptSession  # noqa: E402
+from prompt_toolkit.application import get_app_or_none, run_in_terminal  # noqa: E402
+from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion  # noqa: E402
+from prompt_toolkit.history import InMemoryHistory  # noqa: E402
+from prompt_toolkit.key_binding import KeyBindings  # noqa: E402
+from prompt_toolkit.patch_stdout import patch_stdout  # noqa: E402
+from prompt_toolkit.styles import Style  # noqa: E402
 
 
 RUNS_DIR = ROOT / "runs"
@@ -280,17 +99,18 @@ HELP_TEXT = """\
 
 [b]keyboard[/b]
 
-  [yellow]↑[/yellow] / [yellow]↓[/yellow]                  shell history (or scroll the log if input is empty)
-  [yellow]Ctrl+P[/yellow] / [yellow]Ctrl+N[/yellow]        shell history (always, even with empty input)
+  [yellow]↑[/yellow] / [yellow]↓[/yellow] · [yellow]Ctrl+P[/yellow] / [yellow]Ctrl+N[/yellow]   command history
   [yellow]Tab[/yellow]                   accept autocomplete suggestion
-  [yellow]PageUp[/yellow] / [yellow]PageDown[/yellow]       scroll the output
-  [yellow]Ctrl+Home[/yellow] / [yellow]Ctrl+End[/yellow]    top / bottom (End resumes live tail)
   [yellow]Ctrl+L[/yellow]                clear the screen
+  [yellow]Ctrl+C[/yellow]                cancel the current input line
+  [yellow]Ctrl+D[/yellow]                quit
 
-[b]mouse[/b]
+[b]scroll & select[/b]
 
-  [yellow]Wheel up/down[/yellow]         scroll the output (via terminal alt-scroll mode)
-  Drag to select; [yellow]Cmd+C[/yellow] / [yellow]Ctrl+Shift+C[/yellow] to copy (terminal-native).
+  Scroll with your terminal's native scrollback (mouse wheel / trackpad /
+  Shift+PageUp) and drag to select — [yellow]Cmd+C[/yellow] / [yellow]Ctrl+Shift+C[/yellow] to copy.
+  The app stays out of the terminal's way, so scrolling, selection and
+  copy/paste behave exactly like they do in your shell — no modifier keys.
 
 [b]flags[/b] (work with [cyan]/run[/cyan] and [cyan]/chat[/cyan])
 
@@ -613,96 +433,86 @@ def read_log(path: Path) -> list[dict]:
     return out
 
 
-# --------------------------------------------------------------------------- #
-# Suggester (context-aware autocomplete)
-# --------------------------------------------------------------------------- #
+def _complete(value: str) -> Optional[str]:
+    """Context-aware autocomplete. Given the current input, return the
+    full completed command string (NOT just the suffix), or None.
+    Mirrors the old Textual Suggester: completes the slash-command name,
+    then the first argument for commands that take an agent / run /
+    prompt name."""
+    if not value or not value.startswith("/"):
+        return None
+    if " " not in value:
+        stem = value[1:].lower()
+        if not stem:
+            return None
+        for name in COMMANDS:
+            if name.startswith(stem):
+                return "/" + name
+        return None
+    head, _, rest = value.partition(" ")
+    cmd = head[1:].lower()
+    if " " in rest:
+        return None
+    if cmd in ("run", "chat"):
+        for n in list_agents():
+            if n.startswith(rest):
+                return f"{head} {n}"
+    if cmd in ("view", "tree"):
+        for r in list_runs():
+            if r.name.startswith(rest):
+                return f"{head} {r.name}"
+    if cmd in ("prompt", "prompts", "p"):
+        for n in list_prompts():
+            if n.startswith(rest):
+                return f"{head} {n}"
+    return None
 
 
-class HarnessSuggester(Suggester):
-    def __init__(self) -> None:
-        super().__init__(case_sensitive=False, use_cache=False)
+class HarnessAutoSuggest(AutoSuggest):
+    """Ghost-text autocomplete for the prompt. Tab accepts the suggestion
+    (see the key bindings in Harness.run)."""
 
-    async def get_suggestion(self, value: str) -> Optional[str]:
-        if not value or not value.startswith("/"):
-            return None
-        if " " not in value:
-            stem = value[1:].lower()
-            if not stem:
-                return None
-            for name in COMMANDS:
-                if name.startswith(stem):
-                    return "/" + name
-            return None
-        head, _, rest = value.partition(" ")
-        cmd = head[1:].lower()
-        if " " in rest:
-            return None
-        if cmd in ("run", "chat"):
-            for n in list_agents():
-                if n.startswith(rest):
-                    return f"{head} {n}"
-        if cmd in ("view", "tree"):
-            for r in list_runs():
-                if r.name.startswith(rest):
-                    return f"{head} {r.name}"
-        if cmd in ("prompt", "prompts", "p"):
-            for n in list_prompts():
-                if n.startswith(rest):
-                    return f"{head} {n}"
+    def get_suggestion(self, buffer, document):  # type: ignore[override]
+        text = document.text
+        full = _complete(text)
+        if full and full.startswith(text) and len(full) > len(text):
+            return Suggestion(full[len(text):])
         return None
 
 
 # --------------------------------------------------------------------------- #
-# App
+# Harness REPL
 # --------------------------------------------------------------------------- #
 
-
-CSS = """
-Screen { layout: vertical; }
-#output { height: 1fr; padding: 0 1; }
-/* Status bar flows in the normal vertical layout. Without an explicit
-   height it collapses to its content (so it takes 0 rows when idle and
-   1 row when active). Docking it would put it on top of the prompt /
-   Footer at the same y; flow layout keeps it visible just above the
-   prompt. */
-#status         { height: auto; padding: 0 1; color: $text-muted; }
-#status.busy    { color: $accent; }
-#status.stopped { color: $error; text-style: bold; background: $error 10%; }
-#status.idle    { color: $text-muted; }
-#prompt         { dock: bottom; }
-"""
 
 # Animation frames for the "agent is doing something" spinner. Braille
 # spinner is one cell wide and renders well in monospace terminals.
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
-class HarnessApp(App):
-    CSS = CSS
-    TITLE = "harness"
-    SUB_TITLE = "interactive agent harness"
-    # Textual's built-in command palette is bound to Ctrl+P by default,
-    # which would swallow our readline-style Ctrl+P history binding on the
-    # prompt. We have our own slash-command system (/help, /chat, …) so the
-    # palette is redundant — disable it to free the key.
-    ENABLE_COMMAND_PALETTE = False
-    BINDINGS = [
-        Binding("ctrl+c", "quit", "Quit", show=False),
-        Binding("ctrl+l", "clear", "Clear"),
-        # ↑/↓ are owned by SuggestingInput for command history when there's
-        # something to navigate; SuggestingInput.action_history_prev/next
-        # falls through to the actions below when the input is empty, so
-        # the mouse wheel (via alt-scroll-mode ↑/↓) keeps scrolling the log.
-        Binding("up",        "scroll_one_up",   show=False),
-        Binding("down",      "scroll_one_down", show=False),
-        Binding("pageup",    "scroll_up",     "↑ page"),
-        Binding("pagedown",  "scroll_down",   "↓ page"),
-        Binding("ctrl+home", "scroll_top",    "top"),
-        Binding("ctrl+end",  "scroll_bottom", "bottom"),
-    ]
+def _hesc(s: str) -> str:
+    """Escape text for prompt_toolkit HTML (bottom-toolbar / prompt)."""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+class Harness:
+    """The interactive shell.
+
+    Conversation output is printed straight to the terminal (normal buffer,
+    via a Rich Console) so it lands in native scrollback; a prompt_toolkit
+    PromptSession keeps a live input line + status toolbar pinned at the
+    bottom. Background work (chat turns, runs, the run tail, the Telegram
+    bridge) runs as asyncio tasks / executor jobs and prints above the
+    prompt through prompt_toolkit's patched stdout.
+    """
 
     def __init__(self) -> None:
-        super().__init__()
+        self.console = Console(force_terminal=True)
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._session: Optional[PromptSession] = None
+        self._should_quit: bool = False
+        self._tasks: set[asyncio.Future] = set()
+
         self._session_model: Optional[str] = None
         self._active_run: Optional[Path] = None
         self._active_seen_seq: int = 0
@@ -722,27 +532,32 @@ class HarnessApp(App):
         # _status_label is what the agent is currently doing, e.g.
         # "thinking", "running code_exec". When _status_kind == "busy"
         # the spinner animates next to it; "stopped" sticks a red
-        # banner that explains why we halted; "idle" hides the bar.
+        # banner that explains why we halted; "idle" shows a faint hint.
         self._status_label: str = ""
         self._status_kind: str = "idle"   # "idle" | "busy" | "stopped"
         self._spinner_frame: int = 0
         self._status_clear_at: float = 0.0  # epoch; 0 = no auto-clear
 
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
-        yield RichLog(id="output", highlight=True, markup=True, wrap=True)
-        # Live status bar between the log and the prompt. Always
-        # present so spinner / "stopped" lines have somewhere to land
-        # the instant we have something to say.
-        yield Static("", id="status", classes="idle", markup=True)
-        yield SuggestingInput(
-            placeholder="type a message to chat, or /help for commands  (tab to accept suggestion)",
-            id="prompt",
-            suggester=HarnessSuggester(),
-        )
-        yield Footer()
+    # ---- output ---------------------------------------------------------- #
 
-    def on_mount(self) -> None:
+    def _line(self, text: str = "") -> None:
+        # Lines are either trusted markup or have user content pre-escaped
+        # (via rich.markup.escape) at the call site. Fall back to literal
+        # printing if a line still contains markup we can't parse, so a
+        # stray bracket never crashes the UI.
+        try:
+            self.console.print(text)
+        except Exception:
+            self.console.print(text, markup=False)
+
+    def _echo(self, cmd: str) -> None:
+        self._line(f"[dim]›[/dim] {cmd}")
+
+    def _banner(self) -> None:
+        self.console.print("[b]harness[/b]")
+        self.console.print("[dim]" + "─" * 60 + "[/dim]")
+
+    def _intro(self) -> None:
         self._banner()
         if credentials.get_api_key():
             credentials.inject_env()
@@ -756,87 +571,69 @@ class HarnessApp(App):
                 "[dim](get one at https://openrouter.ai/keys)[/dim]"
             )
         self._line("")
-        self.query_one("#prompt", Input).focus()
-        # Tail fast so tool calls / results land on screen as they happen
-        # rather than in half-second clumps. read_log is cheap (only new
-        # seq rows are rendered).
-        self.set_interval(0.15, self._tail_active_run)
-        self.set_interval(0.4, self._check_pending_approvals)
-        # Spinner tick — runs every 100ms so the braille frames look
-        # alive without flooding the screen. _refresh_status is cheap
-        # when nothing's changed.
-        self.set_interval(0.1, self._tick_status)
-        # ?1007h = enable alternate-scroll-mode: terminal converts wheel
-        # events into ↑/↓ arrow keystrokes. Lets the wheel scroll the log
-        # while leaving normal mouse clicks/drags to the terminal for
-        # native text selection.
-        self._enable_alt_scroll()
-
-    # ---- output ---------------------------------------------------------- #
-
-    def _line(self, text: str = "") -> None:
-        self.query_one("#output", RichLog).write(text)
 
     # ---- live status bar ------------------------------------------------ #
 
+    def _invalidate(self) -> None:
+        """Nudge the prompt to redraw its toolbar now (it also refreshes on
+        a timer, so this just makes status changes feel instant)."""
+        app = get_app_or_none()
+        if app is not None:
+            try:
+                app.invalidate()
+            except Exception:
+                pass
+
     def _set_status(self, kind: str, label: str = "", *, clear_after: float = 0.0) -> None:
         """Update the inline status bar. `kind` is one of:
-          - "idle":    hide the bar (label ignored)
-          - "busy":    show animated spinner + label
-          - "stopped": show red bold stopped-banner with label
+          - "idle":    faint hint line (label ignored)
+          - "busy":    animated spinner + label
+          - "stopped": red stopped-banner with label
         clear_after, if > 0, auto-clears to idle after that many seconds.
         """
         self._status_kind = kind
         self._status_label = label
         self._status_clear_at = time.time() + clear_after if clear_after else 0.0
-        self._refresh_status()
+        self._invalidate()
 
-    def _tick_status(self) -> None:
-        # Auto-clear sticky statuses (e.g. "stopped" / "ready").
+    def _tick_status_clear(self) -> None:
+        # Auto-clear sticky statuses (e.g. "stopped").
         if self._status_clear_at and time.time() >= self._status_clear_at:
             self._status_kind = "idle"
             self._status_label = ""
             self._status_clear_at = 0.0
-        if self._status_kind == "busy":
+            self._invalidate()
+
+    def _bottom_toolbar(self):
+        kind = self._status_kind
+        if kind == "busy":
+            # Advance the spinner each time the toolbar is rendered; with
+            # refresh_interval set on the prompt this animates ~10x/sec.
             self._spinner_frame = (self._spinner_frame + 1) % len(_SPINNER_FRAMES)
-        self._refresh_status()
-
-    def _refresh_status(self) -> None:
-        try:
-            bar = self.query_one("#status", Static)
-        except Exception:
-            return
-        bar.remove_class("busy", "stopped", "idle")
-        if self._status_kind == "busy":
-            bar.add_class("busy")
             frame = _SPINNER_FRAMES[self._spinner_frame]
-            bar.update(f"{frame}  {self._status_label}")
-        elif self._status_kind == "stopped":
-            bar.add_class("stopped")
-            bar.update(f"■  stopped · {self._status_label}")
-        else:
-            bar.add_class("idle")
-            bar.update("")
-
-    def _echo(self, cmd: str) -> None:
-        self._line(f"[dim]›[/dim] {cmd}")
-
-    def _banner(self) -> None:
-        out = self.query_one("#output", RichLog)
-        out.write("[b]harness[/b]")
-        out.write("[dim]" + "─" * 60 + "[/dim]")
+            return HTML(
+                f'<style fg="ansicyan"><b>{frame}</b>  {_hesc(self._status_label)}</style>'
+            )
+        if kind == "stopped":
+            return HTML(
+                f'<style bg="ansired" fg="ansiwhite"><b> ■ stopped </b></style>'
+                f' <style fg="ansired">{_hesc(self._status_label)}</style>'
+            )
+        # idle: faint context hint.
+        model = _hesc(self._effective_model())
+        extra = ""
+        if self._chat is not None:
+            extra += f' · chat:{_hesc(self._chat_agent_name or "")}'
+        if self._telegram and self._telegram.is_running():
+            extra += " · telegram"
+        return HTML(
+            f'<style fg="#808080">{model}{extra} · /help · Ctrl+D to quit</style>'
+        )
 
     # ---- input dispatch ------------------------------------------------- #
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id != "prompt":
-            return
-        inp = event.input
-        if isinstance(inp, SuggestingInput):
-            raw = inp.consume().strip()
-        else:
-            raw = (event.value or "").strip()
-            inp.value = ""
+    def handle(self, raw: str) -> None:
+        raw = raw.strip()
         if not raw:
             return
         # Echo slash commands so the user gets confirmation they ran;
@@ -871,19 +668,47 @@ class HarnessApp(App):
             return
         handler(rest)
 
+    # ---- background tasks ----------------------------------------------- #
+
+    def _spawn(self, coro) -> None:
+        """Fire-and-forget an asyncio task while keeping the prompt
+        responsive (so e.g. /approve still works during a run)."""
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _heartbeat(self) -> None:
+        """Periodic housekeeping: tail the active run, surface pending
+        approvals, and auto-clear sticky statuses. Prints flow above the
+        prompt via patched stdout."""
+        while not self._should_quit:
+            await asyncio.sleep(0.15)
+            try:
+                self._tail_active_run()
+                self._check_pending_approvals()
+                self._tick_status_clear()
+            except Exception:
+                pass
+
     # ---- commands ------------------------------------------------------- #
 
     def _cmd_help(self, _rest: str) -> None:
         self._line(HELP_TEXT)
 
     def _cmd_quit(self, _rest: str) -> None:
-        self.exit()
+        self._should_quit = True
+        app = get_app_or_none()
+        if app is not None:
+            try:
+                app.exit()
+            except Exception:
+                pass
 
     def _cmd_exit(self, _rest: str) -> None:
-        self.exit()
+        self._cmd_quit(_rest)
 
     def _cmd_clear(self, _rest: str) -> None:
-        self.query_one("#output", RichLog).clear()
+        self.console.clear()
         self._banner()
 
     def _cmd_status(self, _rest: str) -> None:
@@ -1069,7 +894,7 @@ class HarnessApp(App):
         Env vars TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOWED_CHAT_IDS still win
         if set. The bridge runs in a background thread with its own
         asyncio loop; each authorized Telegram chat gets its own
-        ChatSession, independent of the textual UI's local chat."""
+        ChatSession, independent of the local chat."""
         parts = rest.strip().split(None, 1)
         sub = (parts[0].lower() if parts else "status")
         arg = (parts[1].strip() if len(parts) > 1 else "")
@@ -1122,8 +947,11 @@ class HarnessApp(App):
             return
 
         def _on_log(msg: str) -> None:
-            # Marshal back to the textual thread.
-            self.call_from_thread(self._line, f"[magenta]telegram[/magenta] · {msg}")
+            # Marshal back onto the UI's event loop thread.
+            if self._loop is not None:
+                self._loop.call_soon_threadsafe(
+                    self._line, f"[magenta]telegram[/magenta] · {msg}"
+                )
 
         bridge = telegram_bridge.TelegramBridge(
             token=token,
@@ -1191,13 +1019,15 @@ class HarnessApp(App):
             self._line(f"[red]missing dependency:[/red] {e}")
             return
         self._line(f"[dim]testing token {credentials.mask(token)} ({len(token)} chars) against api.telegram.org/getMe …[/dim]")
-        self.run_worker(
-            self._do_telegram_test(token),
-            exclusive=False, group="telegram-test", thread=True,
-        )
+        self._spawn(self._do_telegram_test(token))
 
     async def _do_telegram_test(self, token: str) -> None:
-        import asyncio
+        result = await self._loop.run_in_executor(None, self._telegram_test_blocking, token)
+        self._line(result)
+
+    @staticmethod
+    def _telegram_test_blocking(token: str) -> str:
+        import asyncio as _asyncio
         try:
             from telegram import Bot
             from telegram.error import InvalidToken, NetworkError, TelegramError
@@ -1208,20 +1038,19 @@ class HarnessApp(App):
                     me = await bot.get_me()
                 return f"[green]✓ token works[/green]   bot=@{me.username}  id={me.id}  name={me.first_name!r}"
 
-            result = asyncio.run(call())
+            return _asyncio.run(call())
         except InvalidToken as e:
-            result = (
+            return (
                 f"[red]✗ Telegram rejected the token[/red]  ({type(e).__name__}: {e})\n"
                 f"   stored value is {len(token)} chars; real BotFather tokens are typically ~46 chars\n"
                 f"   if length is much longer, you likely pasted the token twice or copied surrounding text"
             )
         except NetworkError as e:
-            result = f"[red]✗ network error reaching Telegram[/red]  ({type(e).__name__}: {e})"
+            return f"[red]✗ network error reaching Telegram[/red]  ({type(e).__name__}: {e})"
         except TelegramError as e:
-            result = f"[red]✗ Telegram error[/red]  ({type(e).__name__}: {e})"
+            return f"[red]✗ Telegram error[/red]  ({type(e).__name__}: {e})"
         except Exception as e:
-            result = f"[red]✗ unexpected error[/red]  ({type(e).__name__}: {e})"
-        self.call_from_thread(self._line, result)
+            return f"[red]✗ unexpected error[/red]  ({type(e).__name__}: {e})"
 
     def _telegram_login(self, token: str) -> None:
         if not token:
@@ -1511,19 +1340,18 @@ class HarnessApp(App):
         self._line("")
         self._is_running = True
         self._set_status("busy", "thinking…")
-        self.run_worker(self._do_chat_turn(user_text), exclusive=True, group="chat", thread=True)
+        self._spawn(self._do_chat_turn(user_text))
 
     async def _do_chat_turn(self, user_text: str) -> None:
         try:
             chat = self._chat
             if chat is None:
-                self.call_from_thread(self._on_chat_reply, "[red]chat ended[/red]", True)
+                self._on_chat_reply("[red]chat ended[/red]", True)
                 return
-            reply = chat.send(user_text)
-            self.call_from_thread(self._on_chat_reply, reply, False)
+            reply = await self._loop.run_in_executor(None, chat.send, user_text)
+            self._on_chat_reply(reply, False)
         except Exception:
-            self.call_from_thread(
-                self._on_chat_reply,
+            self._on_chat_reply(
                 f"[red]chat error:[/red]\n{traceback.format_exc()}",
                 True,
             )
@@ -1622,16 +1450,13 @@ class HarnessApp(App):
         self._active_buf = ""
         self._is_running = True
         self._set_status("busy", "thinking…")
-        self.run_worker(
-            self._do_run(agent, run_dir, message, auto_approve),
-            exclusive=True, group="run", thread=True,
-        )
+        self._spawn(self._do_run(agent, run_dir, message, auto_approve))
 
     async def _do_run(self, agent: Agent, run_dir: Path, message: str, auto_approve: bool = False) -> None:
-        try:
+        def work():
             def grab_ctx(ctx):
                 self._run_ctx = ctx
-            res = run_forest(
+            return run_forest(
                 agent=agent,
                 log_path=run_dir / "log.jsonl",
                 workdir=run_dir / "wd",
@@ -1639,6 +1464,8 @@ class HarnessApp(App):
                 on_ctx=grab_ctx,
                 auto_approve=auto_approve,
             )
+        try:
+            res = await self._loop.run_in_executor(None, work)
             seat = res.root_seat
             if seat.submit_result is not None:
                 head = f"[green]✓ done[/green]  [italic]{seat.submit_result!r}[/italic]"
@@ -1655,10 +1482,9 @@ class HarnessApp(App):
                 f"{seat.tokens_prompt}/{seat.tokens_completion} tok · "
                 f"${seat.cost_usd:.4f}[/dim]"
             )
-            self.call_from_thread(self._on_run_done, summary, final_status)
+            self._on_run_done(summary, final_status)
         except Exception:
-            self.call_from_thread(
-                self._on_run_done,
+            self._on_run_done(
                 f"[red]FAILED:[/red]\n{traceback.format_exc()}",
                 ("stopped", "error during run"),
             )
@@ -1680,7 +1506,7 @@ class HarnessApp(App):
     def _tail_active_run(self) -> None:
         # Incremental: read only the bytes appended since last tick from a
         # stored offset, rather than re-parsing the whole (potentially
-        # multi-MB, full-history) log every 0.15s. A trailing partial line
+        # multi-MB, full-history) log every tick. A trailing partial line
         # is carried in _active_buf until its newline shows up.
         if self._active_run is None:
             return
@@ -1916,82 +1742,89 @@ class HarnessApp(App):
     def _effective_model(self) -> str:
         return self._session_model or DEFAULT_MODEL
 
-    def action_clear(self) -> None:
-        self._cmd_clear("")
+    # ---- main loop ------------------------------------------------------ #
 
-    # ---- scrolling ----------------------------------------------------- #
-    # When the user scrolls back through history, pause auto-scroll so
-    # incoming live entries don't yank them to the bottom mid-read.
-    # Scrolling all the way to the bottom (Ctrl+End) resumes it.
+    def _build_key_bindings(self) -> KeyBindings:
+        kb = KeyBindings()
 
-    def action_scroll_up(self) -> None:
-        out = self.query_one("#output", RichLog)
-        out.auto_scroll = False
-        out.scroll_page_up()
+        @kb.add("tab")
+        def _(event) -> None:
+            # Tab accepts the ghost-text autocomplete suggestion if there
+            # is one; otherwise it does nothing (we have no tab-stops).
+            buf = event.current_buffer
+            suggestion = buf.suggestion
+            if suggestion and suggestion.text:
+                buf.insert_text(suggestion.text)
 
-    def action_scroll_down(self) -> None:
-        out = self.query_one("#output", RichLog)
-        out.scroll_page_down()
-        # If they paged past the bottom, treat that as "resume live".
-        if out.is_vertical_scroll_end:
-            out.auto_scroll = True
+        @kb.add("c-l")
+        def _(event) -> None:
+            # Clear the screen and reprint the banner, like the terminal's
+            # own Ctrl+L but keeping our header.
+            def do() -> None:
+                self.console.clear()
+                self._banner()
+            run_in_terminal(do)
 
-    def action_scroll_one_up(self) -> None:
-        out = self.query_one("#output", RichLog)
-        out.auto_scroll = False
-        out.scroll_up()
+        return kb
 
-    def action_scroll_one_down(self) -> None:
-        out = self.query_one("#output", RichLog)
-        out.scroll_down()
-        if out.is_vertical_scroll_end:
-            out.auto_scroll = True
+    async def run(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._intro()
 
-    def action_scroll_top(self) -> None:
-        out = self.query_one("#output", RichLog)
-        out.auto_scroll = False
-        out.scroll_home()
+        style = Style.from_dict({
+            # Plain (non-reverse) toolbar; colours come from the HTML we
+            # return in _bottom_toolbar.
+            "bottom-toolbar": "noreverse bg:default",
+        })
+        self._session = PromptSession(
+            history=InMemoryHistory(),
+            auto_suggest=HarnessAutoSuggest(),
+            key_bindings=self._build_key_bindings(),
+            bottom_toolbar=self._bottom_toolbar,
+            refresh_interval=0.1,           # animate the spinner
+            complete_while_typing=False,
+            mouse_support=False,            # leave the mouse to the terminal
+            style=style,
+            placeholder=HTML(
+                '<style fg="#666666">type a message to chat, or /help for '
+                'commands  (Tab accepts suggestion)</style>'
+            ),
+        )
+        prompt_fragment = HTML('<style fg="ansicyan">›</style> ')
 
-    def action_scroll_bottom(self) -> None:
-        out = self.query_one("#output", RichLog)
-        out.scroll_end()
-        out.auto_scroll = True
-
-    # ---- alt scroll mode (?1007h) -------------------------------------- #
-    # Translates terminal mouse wheel events into ↑/↓ arrow keys while
-    # leaving clicks/drags to the terminal (so native text selection keeps
-    # working). Supported by xterm, iTerm2, gnome-terminal, kitty, alacritty,
-    # wezterm. Terminal.app supports it but the default profile may have it
-    # off — most users won't need to change anything.
-
-    def _enable_alt_scroll(self) -> None:
-        self._write_raw("\x1b[?1007h")
-
-    def _disable_alt_scroll(self) -> None:
-        self._write_raw("\x1b[?1007l")
-
-    def _write_raw(self, seq: str) -> None:
+        heartbeat = asyncio.ensure_future(self._heartbeat())
         try:
-            self._driver.write(seq)
-            self._driver.flush()
-        except Exception:
-            try:
-                import sys
-                sys.stdout.write(seq)
-                sys.stdout.flush()
-            except Exception:
-                pass
-
-    def on_unmount(self) -> None:
-        self._disable_alt_scroll()
+            with patch_stdout():
+                while not self._should_quit:
+                    try:
+                        text = await self._session.prompt_async(prompt_fragment)
+                    except KeyboardInterrupt:
+                        # Ctrl+C cancels the current line (shell-style).
+                        continue
+                    except EOFError:
+                        # Ctrl+D quits.
+                        break
+                    self.handle(text)
+        finally:
+            self._should_quit = True
+            heartbeat.cancel()
+            if self._telegram and self._telegram.is_running():
+                try:
+                    self._telegram.stop()
+                except Exception:
+                    pass
 
 
 def main() -> int:
-    # mouse=False so terminal-native text selection (and cmd+c / ctrl+shift+c)
-    # works on any terminal without requiring a modifier. Mouse wheel won't
-    # scroll the output as a result — use PageUp / PageDown / Ctrl+End for
-    # that (also faster than the wheel for the long logs we produce).
-    HarnessApp().run(mouse=False)
+    # No alternate screen, no mouse capture: the conversation prints into the
+    # terminal's normal scrollback and only the input line + status toolbar
+    # are pinned at the bottom. That hands scrolling and text selection back
+    # to the terminal, so the wheel/trackpad scroll and drag-to-select copy
+    # work natively, with no modifier keys — exactly like a normal shell.
+    try:
+        asyncio.run(Harness().run())
+    except (KeyboardInterrupt, EOFError):
+        pass
     return 0
 
 
