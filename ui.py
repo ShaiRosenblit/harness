@@ -1794,7 +1794,11 @@ class Harness:
 
         heartbeat = asyncio.ensure_future(self._heartbeat())
         try:
-            with patch_stdout():
+            # raw=True so the Rich ANSI we print above the prompt passes
+            # through untouched. With the default (raw=False) prompt_toolkit
+            # escapes control chars in captured stdout, which renders our
+            # colour codes as literal "?[32m" text once an app is running.
+            with patch_stdout(raw=True):
                 while not self._should_quit:
                     try:
                         text = await self._session.prompt_async(prompt_fragment)
