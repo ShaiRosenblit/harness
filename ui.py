@@ -521,6 +521,7 @@ class Harness:
         self._active_offset: int = 0
         self._active_buf: str = ""
         self._is_running: bool = False
+        self._turn_start: Optional[float] = None
         self._chat = None
         self._chat_agent_name: Optional[str] = None
         self._run_ctx = None   # set by the run worker before driver starts
@@ -1340,6 +1341,8 @@ class Harness:
             self._line(f"[cyan]│[/cyan] {escape(line)}")
         self._line("")
         self._is_running = True
+        # Mark when the turn started so the reply can report how long it took.
+        self._turn_start = time.monotonic()
         self._set_status("busy", "thinking…")
         self._spawn(self._do_chat_turn(user_text))
 
@@ -1357,6 +1360,16 @@ class Harness:
                 True,
             )
 
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        # Compact human-readable duration: "1.4s", "12s", "2m 03s".
+        if seconds < 10:
+            return f"{seconds:.1f}s"
+        if seconds < 60:
+            return f"{round(seconds)}s"
+        minutes, secs = divmod(round(seconds), 60)
+        return f"{minutes}m {secs:02d}s"
+
     def _on_chat_reply(self, reply: str, errored: bool = False) -> None:
         self._tail_active_run()
         if reply:
@@ -1365,9 +1378,14 @@ class Harness:
             # of the answer instead of being buried mid-block. Error replies
             # are pre-formatted with markup, so don't escape those.
             agent = self._chat_agent_name or "agent"
+            # How long the turn took, from user submit to this reply landing.
+            elapsed = ""
+            if self._turn_start is not None:
+                elapsed = f" · {self._format_elapsed(time.monotonic() - self._turn_start)}"
+                self._turn_start = None
             self._line("")
             self._line(
-                f"[b green]● {agent}[/b green]  [dim]· {time.strftime('%H:%M:%S')}[/dim]"
+                f"[b green]● {agent}[/b green]  [dim]· {time.strftime('%H:%M:%S')}{elapsed}[/dim]"
             )
             lines = reply.splitlines() or [""]
             for line in lines:
