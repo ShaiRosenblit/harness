@@ -36,6 +36,7 @@ from textual.binding import Binding  # noqa: E402
 from textual.suggester import Suggester  # noqa: E402
 from textual import events  # noqa: E402
 from textual.widgets import Footer, Header, Input, RichLog, Static  # noqa: E402
+from rich.markup import escape  # noqa: E402
 
 
 _PASTE_MARKER_RE = re.compile(r"\[Pasted #(\d+) \+(\d+) lines\]")
@@ -434,19 +435,46 @@ _TOOL_GLYPH = {
 }
 
 
+# Live-view caps. The full detail is always available via `/view`.
+_MAX_INPUT_LINES = 40    # code_exec / bash source shown before folding
+_MAX_RESULT_LINES = 15   # tool stdout lines shown before folding
+
+
+def _clip_block(lines: list[str], cap: int) -> list[str]:
+    """Escape each content line, cap the count, and append a
+    "… +N more lines" footer when there's more. Markup-safe."""
+    shown = [escape(ln) for ln in lines[:cap]]
+    extra = len(lines) - cap
+    if extra > 0:
+        shown.append(f"… +{extra} more line{'s' if extra != 1 else ''}")
+    return shown
+
+
+def _tool_input_lines(tool: str, args: dict) -> list[str]:
+    """Full multi-line input for code_exec / bash (the whole function /
+    command, not just line 1). Empty for tools whose one-line preview in
+    _tool_arg_preview already says everything."""
+    if not isinstance(args, dict):
+        return []
+    if tool == "code_exec":
+        code = (args.get("code") or "").rstrip()
+        return code.splitlines() if code.strip() else []
+    if tool == "bash":
+        cmd = (args.get("command") or args.get("cmd") or "").rstrip()
+        return cmd.splitlines() if cmd.strip() else []
+    return []
+
+
 def _tool_arg_preview(tool: str, args: dict) -> str:
     """One-line, human-readable hint for what a tool call is doing.
-    Returns "" when there's nothing useful to show."""
+    Returns "" when there's nothing useful to show (or when the full
+    multi-line input is rendered separately, as for code_exec / bash)."""
     if not isinstance(args, dict):
         return ""
-    if tool == "code_exec":
-        code = (args.get("code") or "").strip()
-        first = next((ln for ln in code.splitlines() if ln.strip()), "")
-        return first[:100]
-    if tool == "bash":
-        cmd = (args.get("command") or args.get("cmd") or "").strip()
-        first = next((ln for ln in cmd.splitlines() if ln.strip()), "")
-        return first[:100]
+    if tool in ("code_exec", "bash"):
+        # The full source is rendered as an indented block right under
+        # the tool header; a one-line preview would just duplicate line 1.
+        return ""
     if tool == "spawn":
         agent = args.get("agent") or args.get("name") or ""
         msg = (
@@ -678,6 +706,10 @@ class HarnessApp(App):
         self._session_model: Optional[str] = None
         self._active_run: Optional[Path] = None
         self._active_seen_seq: int = 0
+        # Incremental tail state: byte offset already consumed, plus a
+        # carry buffer for a trailing partial (un-newline-terminated) line.
+        self._active_offset: int = 0
+        self._active_buf: str = ""
         self._is_running: bool = False
         self._chat = None
         self._chat_agent_name: Optional[str] = None
@@ -725,7 +757,10 @@ class HarnessApp(App):
             )
         self._line("")
         self.query_one("#prompt", Input).focus()
-        self.set_interval(0.5, self._tail_active_run)
+        # Tail fast so tool calls / results land on screen as they happen
+        # rather than in half-second clumps. read_log is cheap (only new
+        # seq rows are rendered).
+        self.set_interval(0.15, self._tail_active_run)
         self.set_interval(0.4, self._check_pending_approvals)
         # Spinner tick — runs every 100ms so the braille frames look
         # alive without flooding the screen. _refresh_status is cheap
@@ -805,7 +840,7 @@ class HarnessApp(App):
         if not raw:
             return
         # Echo slash commands so the user gets confirmation they ran;
-        # chat messages render their own "▌ you …" block in _send_chat,
+        # chat messages render their own "┌─ you" block in _send_chat,
         # so echoing here would duplicate the line.
         if raw.startswith("/"):
             self._echo(raw if "\n" not in raw
@@ -1363,6 +1398,8 @@ class HarnessApp(App):
         self._chat_agent_name = agent_name
         self._active_run = run_dir / "log.jsonl"
         self._active_seen_seq = 0
+        self._active_offset = 0
+        self._active_buf = ""
         bits = [f"[cyan]{agent_name}[/cyan]", f"[b]{agent.model}[/b]"]
         if agent.tools:
             bits.append("tools: " + ", ".join(agent.tools))
@@ -1393,6 +1430,8 @@ class HarnessApp(App):
         self._chat_agent_name = None
         self._set_status("idle")
         self._active_run = None
+        self._active_offset = 0
+        self._active_buf = ""
 
     # ---- /prompts, /prompt --------------------------------------------- #
 
@@ -1456,20 +1495,20 @@ class HarnessApp(App):
         if self._is_running:
             self._line("[yellow]busy[/yellow] — wait for the current turn to finish")
             return
+        # Asymmetric "activity log" layout: a thin user-turn marker opens
+        # the turn; the agent's tool calls / thoughts then stream below it
+        # as an indented activity stream; the final answer gets its own
+        # timestamped block in _on_chat_reply once it actually lands. We
+        # deliberately do NOT pre-print an agent header here — there's no
+        # meaningful time to stamp yet, and a bare bar with a pile of tool
+        # output dangling under it is exactly what felt broken.
         self._line("")
         self._line(
-            f"[b cyan]▌ you[/b cyan]  [dim]{time.strftime('%H:%M:%S')}[/dim]"
+            f"[b cyan]┌─ you[/b cyan]  [dim]· {time.strftime('%H:%M:%S')}[/dim]"
         )
         for line in user_text.splitlines() or [""]:
-            self._line(f"  {line}")
-        # Open the agent's block now so the tool calls / inner thoughts
-        # that stream in during the turn appear UNDER its green bar
-        # rather than dangling under the user's blue bar. The timestamp
-        # is deliberately omitted here — the meaningful time is when
-        # the reply actually lands, not when the user submitted, so we
-        # print it next to the reply text in _on_chat_reply instead.
+            self._line(f"[cyan]│[/cyan] {escape(line)}")
         self._line("")
-        self._line(f"[b green]▌ {self._chat_agent_name or 'agent'}[/b green]")
         self._is_running = True
         self._set_status("busy", "thinking…")
         self.run_worker(self._do_chat_turn(user_text), exclusive=True, group="chat", thread=True)
@@ -1492,16 +1531,18 @@ class HarnessApp(App):
     def _on_chat_reply(self, reply: str, errored: bool = False) -> None:
         self._tail_active_run()
         if reply:
-            # Agent header was already printed in _send_chat. The reply
-            # arrives now — stamp it with the *current* time so the
-            # timestamp reflects when the agent actually answered, not
-            # when the user submitted the turn.
-            lines = reply.splitlines() or [""]
+            # The answer block opens HERE — after the activity stream and
+            # at the moment the reply lands — so its timestamp marks the top
+            # of the answer instead of being buried mid-block. Error replies
+            # are pre-formatted with markup, so don't escape those.
+            agent = self._chat_agent_name or "agent"
+            self._line("")
             self._line(
-                f"  [dim]{time.strftime('%H:%M:%S')}[/dim]  {lines[0]}"
+                f"[b green]● {agent}[/b green]  [dim]· {time.strftime('%H:%M:%S')}[/dim]"
             )
-            for line in lines[1:]:
-                self._line(f"  {line}")
+            lines = reply.splitlines() or [""]
+            for line in lines:
+                self._line(f"  {line if errored else escape(line)}")
         self._is_running = False
         if errored:
             self._set_status("stopped", "error during turn", clear_after=8.0)
@@ -1577,6 +1618,8 @@ class HarnessApp(App):
         self._line(f"  [dim]{run_dir}[/dim]")
         self._active_run = run_dir / "log.jsonl"
         self._active_seen_seq = 0
+        self._active_offset = 0
+        self._active_buf = ""
         self._is_running = True
         self._set_status("busy", "thinking…")
         self.run_worker(
@@ -1635,11 +1678,45 @@ class HarnessApp(App):
     # ---- live tail ------------------------------------------------------ #
 
     def _tail_active_run(self) -> None:
+        # Incremental: read only the bytes appended since last tick from a
+        # stored offset, rather than re-parsing the whole (potentially
+        # multi-MB, full-history) log every 0.15s. A trailing partial line
+        # is carried in _active_buf until its newline shows up.
         if self._active_run is None:
             return
-        entries = read_log(self._active_run)
-        new = [e for e in entries if e.get("seq", 0) > self._active_seen_seq]
-        for e in new:
+        path = self._active_run
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        if size < self._active_offset:
+            # File was truncated/replaced (new run in the same slot) — restart.
+            self._active_offset = 0
+            self._active_buf = ""
+        if size == self._active_offset:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                fh.seek(self._active_offset)
+                chunk = fh.read()
+                self._active_offset = fh.tell()
+        except OSError:
+            return
+        data = self._active_buf + chunk
+        lines = data.split("\n")
+        # The last element is whatever follows the final newline — an
+        # incomplete line if the writer is mid-append; hold it for next tick.
+        self._active_buf = lines.pop()
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if e.get("seq", 0) <= self._active_seen_seq:
+                continue
             self._render_live(e)
             self._active_seen_seq = max(self._active_seen_seq, e.get("seq", 0))
 
@@ -1701,43 +1778,70 @@ class HarnessApp(App):
                 text = text[:500].rstrip() + "…"
             for line in text.splitlines():
                 self._line(
-                    f"  {seat_prefix}[italic #9ca3af]💭 {line}[/italic #9ca3af]"
+                    f"  {seat_prefix}[italic #9ca3af]💭 {escape(line)}[/italic #9ca3af]"
                 )
             return
 
         if t == "tool_call":
             tool = p.get("tool") or "?"
+            args = p.get("args") or {}
             # The dedicated "submit" event renders right after this, so
             # skip the tool_call form to avoid showing the same thing twice.
             if tool == "submit":
                 if self._is_running:
                     self._set_status("busy", "finishing…")
                 return
-            preview = _tool_arg_preview(tool, p.get("args") or {})
+            preview = _tool_arg_preview(tool, args)
             glyph = _TOOL_GLYPH.get(tool, "·")
             line = f"  {seat_prefix}{glyph} [b cyan]{tool}[/b cyan]"
             if preview:
-                line += f"  [dim]{preview}[/dim]"
+                line += f"  [dim]{escape(preview)}[/dim]"
             self._line(line)
+            # Full multi-line input (the whole function / command) folded
+            # under the header with a gutter, so the user sees ALL of it
+            # rather than just the first line.
+            for bl in _clip_block(_tool_input_lines(tool, args), _MAX_INPUT_LINES):
+                self._line(f"  {seat_prefix}[dim]│[/dim] [#9ca3af]{bl}[/#9ca3af]")
             if self._is_running:
                 self._set_status("busy", f"running {glyph} {tool}…")
             return
 
         if t == "tool_result":
-            # Once a tool finishes, the model gets the result and starts
-            # thinking about the next move — show that on the bar so the
-            # spinner doesn't freeze on "running …" between turns.
+            tool = p.get("tool") or "?"
+            # submit / spawn have dedicated events that already render their
+            # outcome; their tool_result would just double it.
+            if tool in ("submit", "spawn"):
+                if p.get("ok") and self._is_running:
+                    self._set_status("busy", "thinking…")
+                return
             if p.get("ok"):
+                # Show the actual output, compactly. The full content is in
+                # the log (and via /view); here we fold to _MAX_RESULT_LINES.
+                content = (p.get("content") or "").rstrip()
+                body = content.splitlines() if content else []
+                if len(body) == 1 and len(body[0]) <= 100:
+                    self._line(
+                        f"  {seat_prefix}[green]✓[/green] "
+                        f"[#9ca3af]{escape(body[0])}[/#9ca3af]"
+                    )
+                elif body:
+                    self._line(f"  {seat_prefix}[green]✓[/green] [dim]{tool} result[/dim]")
+                    for bl in _clip_block(body, _MAX_RESULT_LINES):
+                        self._line(f"  {seat_prefix}[dim]│[/dim] [#9ca3af]{bl}[/#9ca3af]")
+                else:
+                    self._line(f"  {seat_prefix}[green]✓[/green] [dim]{tool}[/dim]")
+                # Once a tool finishes, the model gets the result and starts
+                # thinking about the next move — keep the spinner honest.
                 if self._is_running:
                     self._set_status("busy", "thinking…")
                 return
             err = (p.get("error") or "failed").splitlines()[0][:120]
             self._line(
-                f"  {seat_prefix}[red]✗[/red] [b]{p.get('tool')}[/b] "
-                f"[dim]{err}[/dim]"
+                f"  {seat_prefix}[red]✗[/red] [b]{tool}[/b] "
+                f"[dim]{escape(err)}[/dim]"
             )
             if self._is_running:
-                self._set_status("busy", f"recovering from {p.get('tool')} error…")
+                self._set_status("busy", f"recovering from {tool} error…")
             return
 
         if t == "spawn":
