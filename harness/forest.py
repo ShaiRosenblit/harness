@@ -56,5 +56,7 @@ def run_forest(
     finally:
         if ctx._executor is not None:
             ctx._executor.shutdown(wait=True)
+        if ctx._bg_executor is not None:
+            ctx._bg_executor.shutdown(wait=True)
         log.close()
     return ForestResult(root_seat=root, final=result, log_path=log_path)

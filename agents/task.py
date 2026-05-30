@@ -18,7 +18,8 @@ PROMPT = (
 AGENT = Agent(
     model="moonshotai/kimi-k2.6",
     system_prompt=PROMPT,
-    tools=("code_exec", "submit", "spawn", "use_skill"),
+    tools=("code_exec", "submit", "spawn", "spawn_background",
+           "await_task", "check_tasks", "use_skill"),
     max_turns=12,
     max_depth=2,
     max_children=3,

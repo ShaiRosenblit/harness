@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,26 @@ class ToolResult:
     content: str
     error: Optional[str] = None
     meta: dict = field(default_factory=dict)
+
+
+@dataclass
+class BackgroundTask:
+    """A spawn that runs concurrently with its parent instead of blocking it.
+
+    The child runs its own driver loop on the background executor. When it
+    finishes, a done-callback records `result` and pushes `id` into the
+    parent seat's mailbox, so the parent's next turn surfaces it as a
+    notification. `delivered` guards against double-delivery: whichever of
+    the mailbox drain or an explicit await_task() fires first flips it, and
+    the other side skips re-injecting the same result.
+    """
+    id: str
+    child_id: str
+    prompt: str
+    future: Any                       # concurrent.futures.Future[ToolResult]
+    result: Optional[ToolResult] = None
+    done: bool = False
+    delivered: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,6 +85,34 @@ class Seat:
     tokens_completion: int = 0
     cost_usd: float = 0.0
     web_searches: int = 0
+    # Background spawns launched from this seat, keyed by task id. The
+    # mailbox holds ids of tasks that have finished but not yet been
+    # surfaced to the model; the driver drains it at the top of each turn.
+    bg_tasks: Dict[str, "BackgroundTask"] = field(default_factory=dict)
+    _mailbox: List[str] = field(default_factory=list)
+    _mailbox_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def push_mailbox(self, task_id: str) -> None:
+        """Mark a finished background task for delivery. Called from the
+        worker thread via the task's done-callback."""
+        with self._mailbox_lock:
+            self._mailbox.append(task_id)
+
+    def drain_mailbox(self) -> List["BackgroundTask"]:
+        """Pop all pending finished tasks that haven't been delivered yet.
+        Flips each task's `delivered` flag so an explicit await_task() for
+        the same id won't surface it a second time. Called from this seat's
+        own driver thread at the top of a turn."""
+        with self._mailbox_lock:
+            ids = self._mailbox
+            self._mailbox = []
+        out: List["BackgroundTask"] = []
+        for tid in ids:
+            task = self.bg_tasks.get(tid)
+            if task is not None and not task.delivered:
+                task.delivered = True
+                out.append(task)
+        return out
 
 
 @dataclass(frozen=True)

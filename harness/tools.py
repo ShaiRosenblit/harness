@@ -11,6 +11,7 @@ from typing import Dict, Optional
 from .log import Log
 from .types import (
     Agent,
+    BackgroundTask,
     Seat,
     ToolCall,
     ToolResult,
@@ -47,6 +48,12 @@ class RunCtx:
     live_seats: set = field(default_factory=set)
     _spawn_lock: threading.Lock = field(default_factory=threading.Lock)
     _executor: Optional[ThreadPoolExecutor] = None
+    # A SEPARATE pool for background spawns. Kept distinct from `_executor`
+    # on purpose: the blocking parallel-spawn path submits to `_executor`
+    # and waits on the results, so if long-lived background tasks shared
+    # that pool they could occupy every worker and deadlock a parent that
+    # is blocked waiting for a synchronous spawn slot to free up.
+    _bg_executor: Optional[ThreadPoolExecutor] = None
     # Approval gate: pending and resolved requests for risky tool calls.
     _approvals: Dict[str, ApprovalRequest] = field(default_factory=dict)
     _approval_seq: int = 0
@@ -62,6 +69,13 @@ class RunCtx:
                 max_workers=8, thread_name_prefix="harness-spawn"
             )
         return self._executor
+
+    def bg_executor(self) -> ThreadPoolExecutor:
+        if self._bg_executor is None:
+            self._bg_executor = ThreadPoolExecutor(
+                max_workers=8, thread_name_prefix="harness-bg"
+            )
+        return self._bg_executor
 
     def request_approval(self, seat_id: str, tool_name: str, args: dict) -> ApprovalRequest:
         """Register a pending approval; caller blocks on req.event.wait()."""
@@ -423,6 +437,160 @@ def _h_spawn(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
     )
 
 
+def _h_spawn_background(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
+    """Spawn a child that runs CONCURRENTLY with this seat instead of
+    blocking it. Returns immediately with a task id. The child runs its own
+    driver loop on the background executor; when it finishes, its result is
+    delivered to this seat as a notification at the top of a later turn.
+    The seat can also call await_task(id) to block for it or check_tasks()
+    to poll. Same depth/breadth bounds as spawn."""
+    prompt = args.get("prompt", "")
+
+    new_depth = seat.depth + 1
+    if new_depth > seat.max_depth:
+        return ToolResult(
+            ok=False,
+            content=f"depth limit: depth {new_depth} > max {seat.max_depth}",
+            error="depth_exceeded",
+        )
+
+    # Critical section: breadth, child_count, child id mint, live seats.
+    # Background children count against max_children just like blocking ones.
+    with ctx._spawn_lock:
+        if seat.child_count >= seat.max_children:
+            if seat.max_children <= 0:
+                msg = (
+                    "spawn unavailable: this agent's max_children is 0. "
+                    "Relaunch with --max-children N (and --max-depth N if it's 0)."
+                )
+            else:
+                msg = (
+                    f"breadth limit: this agent's max_children={seat.max_children}, "
+                    f"already spawned {seat.child_count}. Relaunch with a higher "
+                    f"--max-children if you need more siblings."
+                )
+            return ToolResult(ok=False, content=msg, error="breadth_exceeded")
+        seat.child_count += 1
+        child_id = f"{seat.id}.{seat.child_count}"
+        ctx.live_seats.add(child_id)
+
+    child = Seat(
+        id=child_id,
+        parent_id=seat.id,
+        depth=new_depth,
+        model=seat.model,
+        system_prompt=seat.system_prompt,
+        tools=seat.tools,
+        web=seat.web,
+        max_turns=seat.max_turns,
+        max_depth=seat.max_depth,
+        max_children=seat.max_children,
+        tool_timeout_s=seat.tool_timeout_s,
+        web_max_results=seat.web_max_results,
+        web_search_context_size=seat.web_search_context_size,
+        autonomous=seat.autonomous,
+        history=[{"role": "user", "content": prompt}],
+    )
+
+    ctx.log.write(
+        seat,
+        "spawn_background",
+        {"child_id": child_id, "prompt": prompt, "depth": new_depth},
+    )
+
+    from .driver import run_seat  # lazy to avoid cycle
+
+    # Register the task BEFORE wiring the done-callback so a fast-finishing
+    # child can't fire the callback (and push to the mailbox) before the
+    # task is discoverable in seat.bg_tasks.
+    future = ctx.bg_executor().submit(run_seat, child, ctx)
+    task = BackgroundTask(
+        id=child_id, child_id=child_id, prompt=prompt, future=future
+    )
+    seat.bg_tasks[child_id] = task
+
+    def _on_done(fut: "object", task: BackgroundTask = task, seat: Seat = seat,
+                 child: Seat = child) -> None:
+        try:
+            child_result = fut.result()
+            final = (
+                child.submit_result
+                if child.submit_result is not None
+                else child_result.content
+            )
+            task.result = ToolResult(
+                ok=child_result.ok and child.halt_reason == "submit",
+                content=final or "",
+                meta={"child_id": child.id, "child_halt_reason": child.halt_reason},
+            )
+        except Exception as e:
+            task.result = ToolResult(
+                ok=False,
+                content=f"background task {task.id} crashed: {e!r}",
+                error="exception",
+            )
+        task.done = True
+        ctx.log.write(
+            seat,
+            "background_done",
+            {"task_id": task.id, "ok": task.result.ok, "error": task.result.error},
+        )
+        seat.push_mailbox(task.id)
+
+    future.add_done_callback(_on_done)
+
+    return ToolResult(
+        ok=True,
+        content=(
+            f"started background task {child_id}; it runs concurrently and its "
+            f"result will be delivered to you when it finishes. Keep working — "
+            f"or call await_task('{child_id}') to block for it, or check_tasks() "
+            f"to poll status."
+        ),
+        meta={"task_id": child_id, "child_id": child_id, "background": True},
+    )
+
+
+def _h_await_task(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
+    """Block until a background task finishes and return its result. Marks
+    the task delivered so the mailbox drain won't also surface it."""
+    task_id = (args.get("task_id") or "").strip()
+    task = seat.bg_tasks.get(task_id)
+    if task is None:
+        known = ", ".join(seat.bg_tasks.keys()) or "(none)"
+        return ToolResult(
+            ok=False,
+            content=f"no background task {task_id!r}. Known tasks: {known}",
+            error="not_found",
+        )
+    task.future.result()   # block; result/exception already captured by callback
+    task.delivered = True
+    res = task.result or ToolResult(ok=False, content="no result", error="empty")
+    return ToolResult(
+        ok=res.ok,
+        content=f"[background task {task_id}] {res.content}",
+        meta={"task_id": task_id, "child_halt_reason": res.meta.get("child_halt_reason")},
+    )
+
+
+def _h_check_tasks(seat: Seat, args: dict, ctx: RunCtx) -> ToolResult:
+    """Non-blocking status of this seat's background tasks."""
+    if not seat.bg_tasks:
+        return ToolResult(ok=True, content="no background tasks", meta={})
+    lines = []
+    for tid, task in seat.bg_tasks.items():
+        if not task.done:
+            status = "running"
+        elif task.delivered:
+            status = "done (delivered)"
+        else:
+            status = "done (result pending delivery)"
+        lines.append(f"- {tid}: {status} — {task.prompt[:80]}")
+    return ToolResult(
+        ok=True, content="\n".join(lines), meta={"count": len(seat.bg_tasks)}
+    )
+
+
 # ---- Registration ----------------------------------------------------------
 
 
@@ -509,6 +677,56 @@ def register_builtins() -> None:
                 "required": ["prompt"],
             },
             handler=_h_spawn,
+        )
+    )
+    register(
+        ToolSpec(
+            name="spawn_background",
+            description=(
+                "Spawn a sub-agent that runs CONCURRENTLY with you instead "
+                "of blocking. Returns immediately with a task id; the child "
+                "runs its own driver loop and its result is delivered to you "
+                "as a notification once it finishes. Use this for work you "
+                "can kick off and keep going past (long fetches, side "
+                "investigations). Use plain `spawn` when you need the result "
+                "before you can continue. You can call await_task(task_id) to "
+                "block for a specific task, or check_tasks() to poll. Bounded "
+                "by your max_depth and max_children, same as spawn."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"prompt": {"type": "string"}},
+                "required": ["prompt"],
+            },
+            handler=_h_spawn_background,
+        )
+    )
+    register(
+        ToolSpec(
+            name="await_task",
+            description=(
+                "Block until a background task (from spawn_background) "
+                "finishes, then return its result. Use when you've reached a "
+                "point where you genuinely need a background task's output "
+                "before proceeding."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"task_id": {"type": "string"}},
+                "required": ["task_id"],
+            },
+            handler=_h_await_task,
+        )
+    )
+    register(
+        ToolSpec(
+            name="check_tasks",
+            description=(
+                "List the status (running / done) of your background tasks "
+                "without blocking."
+            ),
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=_h_check_tasks,
         )
     )
 

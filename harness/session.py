@@ -40,6 +40,9 @@ class ChatSession:
         if self.ctx._executor is not None:
             self.ctx._executor.shutdown(wait=True)
             self.ctx._executor = None
+        if self.ctx._bg_executor is not None:
+            self.ctx._bg_executor.shutdown(wait=True)
+            self.ctx._bg_executor = None
         self.ctx.log.close()
 
 

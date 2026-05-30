@@ -65,6 +65,27 @@ def run_seat(seat: Seat, ctx: RunCtx) -> ToolResult:
             # middle would leave orphaned tool_call_ids.
             maybe_compact(seat, seat.tokens_prompt_last, ctx.log)
 
+            # 2b. Deliver finished background tasks. This is the only
+            # protocol-safe injection point: the previous turn's tool_calls
+            # are all already answered, so appending user-role notifications
+            # here keeps the history well-formed for the next model call.
+            for task in seat.drain_mailbox():
+                res = task.result
+                status = "ok" if (res and res.ok) else "failed"
+                body = res.content if res else "(no result)"
+                ctx.log.write(
+                    seat,
+                    "background_delivered",
+                    {"task_id": task.id, "status": status},
+                )
+                seat.history.append({
+                    "role": "user",
+                    "content": (
+                        f"[background task {task.id} finished — {status}]\n"
+                        f"Sub-task was: {task.prompt}\n\nResult:\n{body}"
+                    ),
+                })
+
             # 3. Model call.
             tool_specs = get_specs(seat.tools)
             resp = call_model(seat, tool_specs, ctx.log)
