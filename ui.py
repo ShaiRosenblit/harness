@@ -558,6 +558,7 @@ class Harness:
         self.console.print("[dim]" + "─" * 60 + "[/dim]")
 
     def _intro(self) -> None:
+        self.console.clear()
         self._banner()
         if credentials.get_api_key():
             credentials.inject_env()
